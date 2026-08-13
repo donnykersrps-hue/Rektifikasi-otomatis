@@ -5,4 +5,3 @@ fontconfig
 fonts-dejavu-core
 fonts-liberation
 libgl1-mesa-glx
-libglib2.0-0
