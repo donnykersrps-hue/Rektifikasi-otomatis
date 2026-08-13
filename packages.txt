@@ -2,4 +2,7 @@ libgeos-dev
 gdal-bin
 libgdal-dev
 fontconfig
-ttf-mscorefonts-installer
+fonts-dejavu-core
+fonts-liberation
+libgl1-mesa-glx
+libglib2.0-0
