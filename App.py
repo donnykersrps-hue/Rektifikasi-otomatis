@@ -244,7 +244,7 @@ def get_model_bounding_box(msp):
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
 # ==============================================================================
-# FUNGSI CREATE_LAYOUT (PERFEKSIONIS & FIX EZDXF BUG)
+# FUNGSI CREATE_LAYOUT (PERFEKSIONIS & FIX EZDXF VIEWPORT)
 # ==============================================================================
 def create_layout(doc, msp, model_bbox, meta):
     """Buat Paperspace Layout A3 ISO Landscape tanpa crash ezdxf"""
@@ -253,11 +253,9 @@ def create_layout(doc, msp, model_bbox, meta):
 
     layout = doc.layouts.new('Gambar Utama')
 
-    # Ukuran Kertas A3 Landscape
     paper_width = 420.0   # mm
     paper_height = 297.0  # mm
 
-    # FIX PERFEKSI: Berikan tuple numerik langsung ke page_setup
     layout.page_setup(size=(paper_width, paper_height), margins=(0, 0, 0, 0))
 
     # ===== FRAME =====
@@ -288,12 +286,13 @@ def create_layout(doc, msp, model_bbox, meta):
     model_center_y = (min_y + max_y) / 2
     view_height = viewport_h / scale
 
+    # Sesuai API ezdxf: view_center diset lewat dxf.view_center_point
     viewport = layout.add_viewport(
         center=(center_vp_x, center_vp_y),
         size=(viewport_w, viewport_h),
-        view_center=(model_center_x, model_center_y),
         view_height=view_height
     )
+    viewport.dxf.view_center_point = (model_center_x, model_center_y)
     viewport.dxf.layer = 'VIEWPORT'
     viewport.dxf.color = 7
     viewport.dxf.on = False
@@ -356,9 +355,9 @@ def create_layout(doc, msp, model_bbox, meta):
     km_viewport = layout.add_viewport(
         center=((km_x1+km_x2)/2, (km_y1+km_y2)/2),
         size=(km_x2-km_x1, km_y2-km_y1),
-        view_center=(model_center_x, model_center_y),
         view_height=view_height * 3
     )
+    km_viewport.dxf.view_center_point = (model_center_x, model_center_y)
     km_viewport.dxf.layer = 'KEYMAP'
     km_viewport.dxf.color = 7
     km_viewport.dxf.on = False
