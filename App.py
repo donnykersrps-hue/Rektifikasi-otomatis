@@ -22,10 +22,13 @@ def latlon_to_meters(lon, lat, ref_lon, ref_lat):
     y = r * math.radians(lat - ref_lat)
     return x, y
 
-def generate_corridor_polylines(coords, width=6.0):
-    """Fallback: Menhitung offset kiri-kanan jika GIS api offline"""
+def generate_smart_corridor(coords, width=6.0):
+    """
+    ENGINE FALLBACK: Membentuk koridor jalan pintar (Batas Kiri, Batas Kanan, dan Centerline)
+    secara presisi mengikuti alur kabel.
+    """
     half_w = width / 2.0
-    left_pts, right_pts = [], []
+    left_pts, right_pts, center_pts = [], [], []
 
     for i in range(len(coords) - 1):
         x1, y1 = coords[i]
@@ -42,22 +45,22 @@ def generate_corridor_polylines(coords, width=6.0):
 
         left_pts.append((x1 + nx * half_w, y1 + ny * half_w))
         right_pts.append((x1 - nx * half_w, y1 - ny * half_w))
+        center_pts.append((x1, y1))
 
         if i == len(coords) - 2:
             left_pts.append((x2 + nx * half_w, y2 + ny * half_w))
             right_pts.append((x2 - nx * half_w, y2 - ny * half_w))
+            center_pts.append((x2, y2))
 
-    return left_pts, right_pts
+    return left_pts, right_pts, center_pts
 
 def fetch_real_road_network(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
     """
-    Menarik data vektor peta jalan resmi & nama jalan asli dari OpenStreetMap (Overpass API)
-    berdasarkan Bounding Box area KMZ secara otomatis.
+    ENGINE PRIMARY: Menarik data jalan resmi & nama jalan dari Overpass API (OSM)
     """
-    # Beri margin 0.002 derajat (~200m) di sekeliling bounding box KMZ
     pad = 0.002
     query = f"""
-    [out:json][timeout:10];
+    [out:json][timeout:5];
     way["highway"]({min_lat-pad},{min_lon-pad},{max_lat+pad},{max_lon+pad});
     out geometry;
     """
@@ -69,7 +72,7 @@ def fetch_real_road_network(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat
             data=query.encode('utf-8'),
             headers={'User-Agent': 'ASPLAN-PRO-Converter/12.1'}
         )
-        with urllib.request.urlopen(req, timeout=8) as response:
+        with urllib.request.urlopen(req, timeout=5) as response:
             data = json.loads(response.read().decode('utf-8'))
         
         roads = []
@@ -86,7 +89,7 @@ def fetch_real_road_network(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat
                 })
         return roads
     except Exception:
-        # Fallback jika terjadi kendala koneksi API
+        # Menyerahkan tugas ke Engine Fallback jika API blocking/timeout
         return []
 
 def parse_kmz(kmz_bytes):
@@ -136,7 +139,7 @@ def parse_kmz(kmz_bytes):
                 })
 
     if not all_raw_coords:
-        return {'cables': [], 'poles': [], 'inspector': [], 'bbox': (0,0,0,0), 'ref': (0,0)}
+        return {'cables': [], 'poles': [], 'roads': [], 'inspector': [], 'bbox': (0,0,0,0), 'ref': (0,0)}
 
     lons = [p[0] for p in all_raw_coords]
     lats = [p[1] for p in all_raw_coords]
@@ -177,9 +180,25 @@ def parse_kmz(kmz_bytes):
             'is_overlap': coord_key in coord_tracker
         })
 
+    # EKSEKUSI HYBRID DUAL-ENGINE UNTUK PETA JALAN
+    real_roads = fetch_real_road_network(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat)
+    final_roads = []
+
+    if real_roads:
+        final_roads = real_roads
+    else:
+        # Fallback: Buat Smart Corridor untuk setiap kabel
+        for cable in converted_cables:
+            left_b, right_b, center_b = generate_smart_corridor(cable['coords'], width=7.0)
+            if left_b:
+                final_roads.append({'name': 'JALAN UTAMA ROUTE', 'coords': left_b, 'type': 'border'})
+            if right_b:
+                final_roads.append({'name': '', 'coords': right_b, 'type': 'border'})
+
     return {
         'cables': converted_cables,
         'poles': converted_poles,
+        'roads': final_roads,
         'inspector': inspector_logs,
         'bbox': (min_lon, min_lat, max_lon, max_lat),
         'ref': (ref_lon, ref_lat)
@@ -189,7 +208,7 @@ def parse_kmz(kmz_bytes):
 # 2. DXF GENERATOR ENGINE (PERFEKSIONIS)
 # ==========================================
 
-def build_dxf_document(parsed_data, proj_info, road_width=6.0):
+def build_dxf_document(parsed_data, proj_info):
     doc = ezdxf.new(dxfversion='AC1027')
     doc.header['$INSUNITS'] = units.MM
 
@@ -205,33 +224,20 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
     msp = doc.modelspace()
     all_x, all_y = [], []
 
-    # A. Fetch & Render Peta Jalan Asli dari GIS (OSM)
-    min_lon, min_lat, max_lon, max_lat = parsed_data['bbox']
-    ref_lon, ref_lat = parsed_data['ref']
-    
-    real_roads = fetch_real_road_network(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat)
-
-    if real_roads:
-        for road in real_roads:
-            pts = road['coords']
+    # A. Render Peta Jalan & Nama Jalan dari Hasil Parsed Hybrid Engine
+    for road in parsed_data.get('roads', []):
+        pts = road['coords']
+        if len(pts) >= 2:
             msp.add_lwpolyline(pts, dxfattribs={'layer': '01_BADAN_JALAN'})
             
-            # Tulis Nama Jalan di Tengah Segmen jika ada
-            if road['name'] and len(pts) >= 2:
+            # Tulis Nama Jalan di Tengah Segmen
+            if road.get('name'):
                 mid_idx = len(pts) // 2
                 mid_pt = pts[mid_idx]
                 msp.add_text(road['name'].upper(), dxfattribs={
                     'layer': '01_NAMA_JALAN',
                     'height': 2.5
                 }).set_placement((mid_pt[0], mid_pt[1] + 1.5))
-    else:
-        # Fallback corridor generator jika offline
-        for cable in parsed_data['cables']:
-            left_b, right_b = generate_corridor_polylines(cable['coords'], width=road_width)
-            if left_b:
-                msp.add_lwpolyline(left_b, dxfattribs={'layer': '01_BADAN_JALAN'})
-            if right_b:
-                msp.add_lwpolyline(right_b, dxfattribs={'layer': '01_BADAN_JALAN'})
 
     # B. Render Kabel Utama
     for cable in parsed_data['cables']:
@@ -251,7 +257,7 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
         all_x.append(pos[0])
         all_y.append(pos[1])
 
-        # Gambar Tiang (Termasuk yang overlap tetap digambar)
+        # Gambar Tiang
         msp.add_circle(pos, radius=0.8, dxfattribs={'layer': '04_POLE_TIANG'})
 
         text_y_offset = 0.8
@@ -276,7 +282,6 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
         else:
             display_name = name
 
-        # Jika overlap, geser offset vertikal teks agar tidak menumpuk
         if p.get('is_overlap'):
             text_y_offset += 1.2
 
@@ -290,7 +295,6 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
     else:
         layout = doc.layouts.new("Paper_A3_Presentation")
 
-    # Kunci ukuran kertas A3 (420mm x 297mm)
     layout.dxf.paper_width = 420.0
     layout.dxf.paper_height = 297.0
 
@@ -320,7 +324,6 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
 # 3. STREAMLIT UI INTERFACE
 # ==========================================
 
-# Sidebar Forms
 st.sidebar.title("📇 Informasi Proyek (Kop Gambar)")
 span_name = st.sidebar.text_input("SPAN NAME", "14PBG007_REMBANGPBLG - 14PBG03...")
 name_project = st.sidebar.text_input("NAME OF PROJECT", "AS BUILD")
@@ -334,7 +337,6 @@ approved_by = st.sidebar.text_input("APPROVED BY (Initial)", "IFORTE")
 st.sidebar.title("⚙️ Parameter Gambar")
 revision = st.sidebar.text_input("REVISION", "0")
 
-# Main Content
 st.title("ASPLAN PRO v12.1 - KMZ to DXF Converter")
 
 uploaded_file = st.file_uploader("Upload File KMZ Proyek", type=['kmz'])
@@ -343,7 +345,7 @@ if uploaded_file:
     parsed = parse_kmz(uploaded_file.read())
     
     st.subheader(f"📦 File: {uploaded_file.name}")
-    st.write(f"Ditemukan {len(parsed['cables'])} segmen kabel dan {len(parsed['poles'])} tiang.")
+    st.write(f"Ditemukan {len(parsed['cables'])} segmen kabel, {len(parsed['poles'])} tiang, dan {len(parsed['roads'])} jalur peta jalan.")
 
     col1, col2 = st.columns([1, 1])
 
@@ -353,16 +355,22 @@ if uploaded_file:
         ax.set_facecolor('#0e1117')
         fig.patch.set_facecolor('#0e1117')
 
-        # Preview Plot Kabel
+        # 1. PREVIEW PLOT PETA JALAN (Garis Abu-abu)
+        for r in parsed.get('roads', []):
+            r_xs = [pt[0] for pt in r['coords']]
+            r_ys = [pt[1] for pt in r['coords']]
+            ax.plot(r_xs, r_ys, color='#888888', linestyle='--', linewidth=1, alpha=0.7)
+
+        # 2. PREVIEW PLOT KABEL (Garis Merah)
         for c in parsed['cables']:
             xs = [pt[0] for pt in c['coords']]
             ys = [pt[1] for pt in c['coords']]
-            ax.plot(xs, ys, color='#ff4b4b', linewidth=2)
+            ax.plot(xs, ys, color='#ff4b4b', linewidth=2.5)
 
-        # Preview Plot Tiang
+        # 3. PREVIEW PLOT TIANG (Titik Hijau)
         pxs = [p['coords'][0] for p in parsed['poles']]
         pys = [p['coords'][1] for p in parsed['poles']]
-        ax.scatter(pxs, pys, color='#00ff7f', s=15)
+        ax.scatter(pxs, pys, color='#00ff7f', s=15, zorder=5)
 
         ax.tick_params(colors='white')
         ax.grid(True, color='#333333', linestyle='--')
@@ -376,7 +384,6 @@ if uploaded_file:
         else:
             st.success("Semua geometri presisi! Tidak ditemukan tumpukan tiang.")
 
-    # Generate DXF Button
     proj_data = {
         'span_name': span_name,
         'project_code': project_code,
