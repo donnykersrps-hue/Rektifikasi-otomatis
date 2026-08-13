@@ -18,14 +18,14 @@ import numpy as np
 # CONFIG & PAGE SETUP
 # ==============================================================================
 st.set_page_config(
-    page_title="ASPLAN PRO v11.3 - KMZ to DXF Converter & Layout Generator",
+    page_title="ASPLAN PRO v11.4 - KMZ to DXF Converter & Layout Generator",
     page_icon="🗺️",
     layout="wide"
 )
 
 ox.settings.use_cache = True
 ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v11.3"
+ox.settings.user_agent = "AsplanPro_v11.4"
 
 ROAD_WIDTHS = {
     'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
@@ -46,7 +46,7 @@ with st.sidebar:
     date = st.date_input("Tanggal", datetime.now())
     include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
     st.markdown("---")
-    st.caption("ASPLAN PRO v11.3 - © 2026")
+    st.caption("ASPLAN PRO v11.4 - © 2026")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -216,7 +216,6 @@ def add_span_labels(msp, cable_line, to_m_func):
 def get_model_bounding_box(msp):
     min_x = min_y = float('inf')
     max_x = max_y = float('-inf')
-
     for entity in msp:
         if entity.dxftype() == 'LWPOLYLINE':
             for pt in entity.get_points():
@@ -235,28 +234,27 @@ def get_model_bounding_box(msp):
             x, y = entity.dxf.insert.x, entity.dxf.insert.y
             min_x = min(min_x, x); min_y = min(min_y, y)
             max_x = max(max_x, x); max_y = max(max_y, y)
-
     if min_x == float('inf'):
         return (0, 0, 1, 1)
-
     pad_x = (max_x - min_x) * 0.1 if max_x != min_x else 1
     pad_y = (max_y - min_y) * 0.1 if max_y != min_y else 1
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
 # ==============================================================================
-# FUNGSI CREATE_LAYOUT (PERFEKSIONIS & FIX EZDXF VIEWPORT)
+# FUNGSI CREATE_LAYOUT (DIPERBAIKI DENGAN view_center_point)
 # ==============================================================================
 def create_layout(doc, msp, model_bbox, meta):
-    """Buat Paperspace Layout A3 ISO Landscape tanpa crash ezdxf"""
+    """Buat Paperspace Layout A3 ISO Landscape - versi fix untuk ezdxf"""
     if 'Gambar Utama' in doc.layouts:
         doc.layouts.delete('Gambar Utama')
 
     layout = doc.layouts.new('Gambar Utama')
 
+    # Perbaiki page_setup: gunakan ('A3','Landscape') bukan tuple angka
+    layout.page_setup(size=('A3', 'Landscape'), margins=(0, 0, 0, 0))
+
     paper_width = 420.0   # mm
     paper_height = 297.0  # mm
-
-    layout.page_setup(size=(paper_width, paper_height), margins=(0, 0, 0, 0))
 
     # ===== FRAME =====
     margin = 10
@@ -286,13 +284,13 @@ def create_layout(doc, msp, model_bbox, meta):
     model_center_y = (min_y + max_y) / 2
     view_height = viewport_h / scale
 
-    # Sesuai API ezdxf: view_center diset lewat dxf.view_center_point
+    # 🔥 PERBAIKAN: tambahkan view_center_point langsung di add_viewport
     viewport = layout.add_viewport(
         center=(center_vp_x, center_vp_y),
         size=(viewport_w, viewport_h),
-        view_height=view_height
+        view_height=view_height,
+        view_center_point=(model_center_x, model_center_y)
     )
-    viewport.dxf.view_center_point = (model_center_x, model_center_y)
     viewport.dxf.layer = 'VIEWPORT'
     viewport.dxf.color = 7
     viewport.dxf.on = False
@@ -322,7 +320,6 @@ def create_layout(doc, msp, model_bbox, meta):
     y_pos -= 6
     add_text(layout, f"Scale   : 1:{int(scale*1000) if scale*1000>1 else 1}", tb_x1+5, y_pos, height=3)
     y_pos -= 8
-
     layout.add_line((tb_x1, y_pos), (tb_x2, y_pos), dxfattribs={'layer': 'TITLE', 'color': 7})
     y_pos -= 4
     add_text(layout, "Verifier : " + meta['verifier'], tb_x1+5, y_pos, height=2.5)
@@ -355,9 +352,9 @@ def create_layout(doc, msp, model_bbox, meta):
     km_viewport = layout.add_viewport(
         center=((km_x1+km_x2)/2, (km_y1+km_y2)/2),
         size=(km_x2-km_x1, km_y2-km_y1),
-        view_height=view_height * 3
+        view_height=view_height * 3,
+        view_center_point=(model_center_x, model_center_y)
     )
-    km_viewport.dxf.view_center_point = (model_center_x, model_center_y)
     km_viewport.dxf.layer = 'KEYMAP'
     km_viewport.dxf.color = 7
     km_viewport.dxf.on = False
@@ -452,7 +449,7 @@ def render_compact_viewport(data, road_polygons, to_m_func):
 # ==============================================================================
 # MAIN APP
 # ==============================================================================
-st.title("⚡ ASPLAN PRO v11.3")
+st.title("⚡ ASPLAN PRO v11.4")
 st.subheader("Interactive CAD Converter with Layout & Precision Inspector")
 
 uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
@@ -472,7 +469,18 @@ if uploaded_files:
                 with zf.open(kml_files[0]) as f:
                     data = parse_kml_brute_force(f.read())
 
+            # Validasi data
+            if not data['lines'] and not data['points']:
+                st.warning("⚠️ File ini tidak memiliki data garis atau titik yang bisa diproses.")
+                continue
+
+            st.caption(f"📊 Ditemukan {len(data['lines'])} segmen kabel dan {len(data['points'])} tiang.")
+
             center_lat, center_lon = get_center_point_from_kml(data)
+            if center_lat is None or center_lon is None:
+                st.error("Tidak dapat menentukan titik tengah. Pastikan ada data koordinat.")
+                continue
+
             cable_length_deg = sum([
                 math.sqrt((l['coords'][-1][0]-l['coords'][0][0])**2 + (l['coords'][-1][1]-l['coords'][0][1])**2)
                 for l in data['lines'] if len(l['coords']) >= 2
@@ -533,7 +541,7 @@ if uploaded_files:
                     df_issues = pd.DataFrame(issues)
                     st.dataframe(df_issues, use_container_width=True, hide_index=True)
 
-            # BUILD DXF
+            # ===== BUILD DXF =====
             doc = ezdxf.new(setup=True)
             doc.styles.new("ARIAL_STD", dxfattribs={"font": "arial.ttf"})
             msp = doc.modelspace()
@@ -578,7 +586,7 @@ if uploaded_files:
                 else:
                     msp.add_text(p_name, dxfattribs={'layer': '04_POLE', 'height': 2.0, 'style': 'ARIAL_STD', 'color': 7}).set_placement((mx + 3, my + 3))
 
-            # LAYOUT (PAPERSPACE)
+            # ===== LAYOUT (PAPERSPACE) =====
             if include_layout:
                 model_bbox = get_model_bounding_box(msp)
                 meta = {
@@ -590,7 +598,7 @@ if uploaded_files:
                 }
                 create_layout(doc, msp, model_bbox, meta)
 
-            # OUTPUT
+            # ===== OUTPUT =====
             out_stream = io.StringIO()
             doc.write(out_stream)
 
@@ -605,3 +613,4 @@ if uploaded_files:
 
         except Exception as e:
             st.error(f"Gagal memproses file: {e}")
+            st.exception(e)   # untuk debugging
