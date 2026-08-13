@@ -18,14 +18,14 @@ import numpy as np
 # CONFIG & PAGE SETUP
 # ==============================================================================
 st.set_page_config(
-    page_title="ASPLAN PRO v11.5 - KMZ to DXF Converter & Layout Generator",
+    page_title="ASPLAN PRO v11.6 - KMZ to DXF Converter & Layout Generator",
     page_icon="🗺️",
     layout="wide"
 )
 
 ox.settings.use_cache = True
 ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v11.5"
+ox.settings.user_agent = "AsplanPro_v11.6"
 
 ROAD_WIDTHS = {
     'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
@@ -46,7 +46,7 @@ with st.sidebar:
     date = st.date_input("Tanggal", datetime.now())
     include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
     st.markdown("---")
-    st.caption("ASPLAN PRO v11.5 - © 2026")
+    st.caption("ASPLAN PRO v11.6 - © 2026")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -103,7 +103,7 @@ def smart_rename(name):
         return ""
     n = str(name).upper().strip()
 
-    # 1. Deteksi Closure (prioritas karena bisa mengandung angka)
+    # 1. Deteksi Closure
     if any(re.search(pattern, n) for pattern in [r'\bCLOS\b', r'\bCLOSURE\b', r'\bCL\d*', r'\bCLS\d*', r'\bC\d+']):
         numbers = re.findall(r'\d+', n)
         if numbers:
@@ -241,23 +241,20 @@ def get_model_bounding_box(msp):
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
 # ==============================================================================
-# FUNGSI CREATE_LAYOUT (DIPERBAIKI TANPA page_setup)
+# FUNGSI CREATE_LAYOUT (PERFEKSIONIS & BEBAS BUG)
 # ==============================================================================
 def create_layout(doc, msp, model_bbox, meta):
-    """Buat Paperspace Layout A3 dengan pengaturan atribut DXF langsung"""
+    """Buat Paperspace Layout A3 ISO Landscape dengan page_setup resmi ezdxf"""
     if 'Gambar Utama' in doc.layouts:
         doc.layouts.delete('Gambar Utama')
 
     layout = doc.layouts.new('Gambar Utama')
 
-    # ===== SET PAPER SIZE DIRECTLY (tanpa page_setup) =====
     paper_width = 420.0   # mm
     paper_height = 297.0  # mm
-    layout.dxf.paper_width = paper_width
-    layout.dxf.paper_height = paper_height
-    layout.dxf.paper_units = 4          # 4 = millimeters
-    layout.dxf.paper_size = "A3"
-    layout.dxf.plot_paper_size = "A3"
+
+    # SOLUSI PRESISI: Menggunakan page_setup dengan tuple angka dan unit 'mm'
+    layout.page_setup(size=(paper_width, paper_height), unit='mm', margins=(0, 0, 0, 0))
 
     # ===== FRAME =====
     margin = 10
@@ -287,7 +284,6 @@ def create_layout(doc, msp, model_bbox, meta):
     model_center_y = (min_y + max_y) / 2
     view_height = viewport_h / scale
 
-    # view_center_point wajib diisi langsung
     viewport = layout.add_viewport(
         center=(center_vp_x, center_vp_y),
         size=(viewport_w, viewport_h),
@@ -452,7 +448,7 @@ def render_compact_viewport(data, road_polygons, to_m_func):
 # ==============================================================================
 # MAIN APP
 # ==============================================================================
-st.title("⚡ ASPLAN PRO v11.5")
+st.title("⚡ ASPLAN PRO v11.6")
 st.subheader("Interactive CAD Converter with Layout & Precision Inspector")
 
 uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
@@ -472,7 +468,6 @@ if uploaded_files:
                 with zf.open(kml_files[0]) as f:
                     data = parse_kml_brute_force(f.read())
 
-            # Validasi data
             if not data['lines'] and not data['points']:
                 st.warning("⚠️ File ini tidak memiliki data garis atau titik yang bisa diproses.")
                 continue
@@ -616,4 +611,3 @@ if uploaded_files:
 
         except Exception as e:
             st.error(f"Gagal memproses file: {e}")
-            st.exception(e)   # menampilkan traceback untuk debugging
