@@ -220,7 +220,11 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
         }).set_placement((pos[0] + 1.8, pos[1] + text_y_offset))
 
     # C. Dynamic Viewport A3 Layout Space
-    layout = doc.layouts.get("Paper_A3_Presentation")
+    if "Paper_A3_Presentation" in doc.layouts:
+        layout = doc.layouts.get("Paper_A3_Presentation")
+    else:
+        layout = doc.layouts.new("Paper_A3_Presentation")
+
     layout.page_setup(size=(420, 297), unit="mm")
 
     min_x, max_x = (min(all_x), max(all_x)) if all_x else (0, 100)
