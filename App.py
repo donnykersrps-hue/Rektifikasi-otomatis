@@ -1,678 +1,323 @@
 import streamlit as st
-import os
 import ezdxf
-from ezdxf.enums import TextEntityAlignment
-import osmnx as ox
-import math
-from zipfile import ZipFile
+from ezdxf import units
 import xml.etree.ElementTree as ET
-from shapely.geometry import LineString, Point, Polygon, MultiPolygon
-from shapely.ops import unary_union
-import re
-from datetime import datetime
+import zipfile
+import math
 import io
-import pandas as pd
 import matplotlib.pyplot as plt
-import numpy as np
 
-# ==============================================================================
-# CONFIG & PAGE SETUP
-# ==============================================================================
-st.set_page_config(
-    page_title="ASPLAN PRO v12.1 - KMZ to DXF Converter & Layout Generator",
-    page_icon="🗺️",
-    layout="wide"
-)
+st.set_page_config(page_title="ASPLAN PRO v12.1", layout="wide")
 
-ox.settings.use_cache = True
-ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v12.1"
+# ==========================================
+# 1. HELPER & UTILITY FUNCTIONS
+# ==========================================
 
-ROAD_WIDTHS = {
-    'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
-    'secondary': 12.0, 'tertiary': 10.0, 'residential': 8.0,
-    'service': 5.0, 'unclassified': 7.0
-}
+def latlon_to_meters(lon, lat, ref_lon, ref_lat):
+    """Konversi koordinat Lat/Lon (derajat) ke Meter lokal (Mercator/Flat Projection)"""
+    r = 6378137.0 # Jari-jari bumi
+    x = r * math.radians(lon - ref_lon) * math.cos(math.radians(ref_lat))
+    y = r * math.radians(lat - ref_lat)
+    return x, y
 
-# ==============================================================================
-# SIDEBAR - METADATA KOP GAMBAR (INPUT DINAMIS STANDAR IFORTE)
-# ==============================================================================
-with st.sidebar:
-    st.image("https://via.placeholder.com/150x50?text=LOGO", use_container_width=True)
-    st.header("📋 Informasi Proyek (Kop Gambar)")
-    
-    # 1. SPAN & PROYEK
-    span_name = st.text_input("SPAN NAME", "14PBG007_REMBANGPBLG - 14PBG031_PENGADEGAN_TB")
-    project_name = st.text_input("NAME OF PROJECT", "AS BUILD")
-    project_code = st.text_input("PROJECT CODE / REVISION CODE", "RM-26-000327")
-    
-    st.markdown("---")
-    st.subheader("✍️ Personel & Otorisasi")
-    
-    # 2. TABEL PERSETUJUAN
-    drawn_by = st.text_input("DRAWN BY (Initial)", "RPS")
-    checked_by = st.text_input("CHECKED BY (Initial)", "IFORTE")
-    approved_by = st.text_input("APPROVED BY (Initial)", "IFORTE")
-    
-    st.markdown("---")
-    st.subheader("⚙️ Parameter Gambar")
-    
-    # 3. REVISION, SCALE, PAGE & DATE
-    revision_val = st.text_input("REVISION", "0")
-    scale_val = st.text_input("SCALE", "AS INFO")
-    page_val = st.text_input("PAGE", "1 OF 1")
-    date_val = st.date_input("DATE", datetime.now())
-    
-    include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
-    st.markdown("---")
-    st.caption("ASPLAN PRO v12.1 - © 2026")
+def generate_corridor_polylines(coords, width=6.0):
+    """
+    Menghitung vektor offset kiri & kanan dari alur kabel 
+    untuk menggambarkan badan jalan secara otomatis.
+    """
+    half_w = width / 2.0
+    left_pts, right_pts = [], []
 
-# ==============================================================================
-# HELPER FUNCTIONS
-# ==============================================================================
-def parse_kml_brute_force(kml_bytes):
-    features = {'lines': [], 'points': []}
-    kml_str = kml_bytes.decode('utf-8', errors='ignore')
-    kml_str = re.sub(r'xmlns="[^"]+"', '', kml_str, count=1)
-    try:
-        root = ET.fromstring(kml_str)
-    except Exception:
-        return features
+    for i in range(len(coords) - 1):
+        x1, y1 = coords[i]
+        x2, y2 = coords[i+1]
 
-    for pm in root.findall('.//Placemark'):
-        name = pm.find('name').text if pm.find('name') is not None and pm.find('name').text else "No Name"
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.hypot(dx, dy)
+        if length == 0:
+            continue
 
-        # LineString
-        ls = pm.find('.//LineString/coordinates')
-        if ls is not None and ls.text:
-            coords = []
-            for c in ls.text.strip().split():
-                parts = c.split(',')
+        nx = -dy / length
+        ny = dx / length
+
+        left_pts.append((x1 + nx * half_w, y1 + ny * half_w))
+        right_pts.append((x1 - nx * half_w, y1 - ny * half_w))
+
+        if i == len(coords) - 2:
+            left_pts.append((x2 + nx * half_w, y2 + ny * half_w))
+            right_pts.append((x2 - nx * half_w, y2 - ny * half_w))
+
+    return left_pts, right_pts
+
+def parse_kmz(kmz_bytes):
+    """Parsing KMZ/KML dan ekstraksi data kabel & tiang + deteksi overlap"""
+    with zipfile.ZipFile(io.BytesIO(kmz_bytes)) as z:
+        kml_name = [f for f in z.namelist() if f.endswith('.kml')][0]
+        kml_content = z.read(kml_name)
+
+    root = ET.fromstring(kml_content)
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+
+    cables = []
+    poles = []
+    all_raw_coords = []
+
+    # Ekstraksi LineString (Kabel)
+    for placemark in root.findall('.//kml:Placemark', ns):
+        line = placemark.find('.//kml:LineString/kml:coordinates', ns)
+        if line is not None and line.text:
+            raw_pts = line.text.strip().split()
+            pts = []
+            for pt in raw_pts:
+                parts = pt.split(',')
                 if len(parts) >= 2:
-                    try:
-                        coords.append((float(parts[0]), float(parts[1])))
-                    except ValueError:
-                        continue
-            if len(coords) >= 2:
-                features['lines'].append({
-                    'geom': LineString(coords),
+                    lon, lat = float(parts[0]), float(parts[1])
+                    pts.append((lon, lat))
+                    all_raw_coords.append((lon, lat))
+            if pts:
+                cables.append({'name': placemark.findtext('kml:name', '', ns), 'coords': pts})
+
+        # Ekstraksi Point (Tiang)
+        point = placemark.find('.//kml:Point/kml:coordinates', ns)
+        if point is not None and point.text:
+            parts = point.text.strip().split(',')
+            if len(parts) >= 2:
+                lon, lat = float(parts[0]), float(parts[1])
+                name = placemark.findtext('kml:name', 'Pole', ns)
+                all_raw_coords.append((lon, lat))
+                
+                # Cek apakah tiang memiliki aksesoris (berdasarkan deskripsi/style/nama)
+                desc = placemark.findtext('kml:description', '', ns).lower()
+                has_acc = 'acc' in desc or 'accessories' in desc or 'slack' in desc or 'box' in desc
+                
+                poles.append({
                     'name': name,
-                    'coords': coords
+                    'raw_coords': (lon, lat),
+                    'has_accessories': has_acc
                 })
 
-        # Point
-        pt = pm.find('.//Point/coordinates')
-        if pt is not None and pt.text:
-            c = pt.text.strip().split(',')
-            if len(c) >= 2:
-                try:
-                    features['points'].append({
-                        'geom': Point(float(c[0]), float(c[1])),
-                        'name': name,
-                        'orig': (float(c[0]), float(c[1]))
-                    })
-                except ValueError:
-                    continue
+    if not all_raw_coords:
+        return {'cables': [], 'poles': [], 'inspector': []}
 
-    return features
+    # Hitung Center Reference untuk proyeksi meter lokal
+    ref_lon = sum(pt[0] for pt in all_raw_coords) / len(all_raw_coords)
+    ref_lat = sum(pt[1] for pt in all_raw_coords) / len(all_raw_coords)
 
-def smart_rename(name):
-    """Logika presisi penamaan aksesoris: Closure & Slack/SS/Hanger"""
-    if not name or pd.isna(name):
-        return ""
-    n = str(name).upper().strip()
+    # Konversi koordinat Kabel ke Meter
+    converted_cables = []
+    for c in cables:
+        m_pts = [latlon_to_meters(lon, lat, ref_lon, ref_lat) for lon, lat in c['coords']]
+        converted_cables.append({'name': c['name'], 'coords': m_pts})
 
-    # 1. Deteksi Closure
-    if any(re.search(pattern, n) for pattern in [r'\bCLOS\b', r'\bCLOSURE\b', r'\bCL\d*', r'\bCLS\d*', r'\bC\d+']):
-        numbers = re.findall(r'\d+', n)
-        if numbers:
-            num = max(int(x) for x in numbers)
-            return f"New Closure {num}C"
-        return "New Closure"
+    # Konversi koordinat Tiang & Deteksi Overlap
+    converted_poles = []
+    inspector_logs = []
+    coord_tracker = {}
 
-    # 2. Deteksi Slack / SS / Hanger
-    if any(re.search(pattern, n) for pattern in [r'\bSLACK\b', r'\.SS\b', r'\bSS\b', r'\bHANGER\b']):
-        return "New Slack Support"
+    for p in poles:
+        mx, my = latlon_to_meters(p['raw_coords'][0], p['raw_coords'][1], ref_lon, ref_lat)
+        coord_key = (round(mx, 2), round(my, 2))
 
-    return name
-
-def get_center_point_from_kml(data):
-    if not data['lines'] and not data['points']:
-        return None, None
-    if not data['lines']:
-        lats = [p['orig'][1] for p in data['points']]
-        lons = [p['orig'][0] for p in data['points']]
-        return sum(lats)/len(lats), sum(lons)/len(lons)
-    cable_coords = data['lines'][0]['coords']
-    mid_idx = len(cable_coords) // 2
-    return cable_coords[mid_idx][1], cable_coords[mid_idx][0]
-
-def create_road_buffer_fixed(line_coords_meters, width):
-    if len(line_coords_meters) < 2:
-        return None
-    line = LineString(line_coords_meters)
-    effective_width = max(width, 3.0)
-    try:
-        polygon = line.buffer(
-            effective_width / 2, cap_style=2, join_style=2, resolution=16, quad_segs=8
-        )
-        if isinstance(polygon, Polygon) and not polygon.is_empty:
-            return polygon
-        return line.buffer(effective_width / 2)
-    except Exception:
-        return line.buffer(effective_width / 2)
-
-def add_road_label(msp, line_coords, road_name, layer_name):
-    if not road_name or pd.isna(road_name) or str(road_name).lower() == 'nan':
-        return
-    road_str = str(road_name).strip()
-    if not road_str or len(line_coords) < 2:
-        return
-    line = LineString(line_coords)
-    length = line.length
-    if length < 80:
-        return
-    mid_point = line.interpolate(0.5, normalized=True)
-    p1 = Point(line_coords[0])
-    p2 = Point(line_coords[-1])
-    dx = p2.x - p1.x
-    dy = p2.y - p1.y
-    angle_rad = math.atan2(dy, dx)
-    angle_deg = math.degrees(angle_rad)
-    while angle_deg > 90:
-        angle_deg -= 180
-    while angle_deg < -90:
-        angle_deg += 180
-    font_height = 2.5 if length > 150 else 1.8
-    offset_dist = font_height * 1.5
-    offset_x = -offset_dist * math.sin(angle_rad)
-    offset_y = offset_dist * math.cos(angle_rad)
-    msp.add_text(
-        road_str,
-        dxfattribs={
-            'layer': layer_name,
-            'height': font_height,
-            'rotation': angle_deg,
-            'style': 'ARIAL_STD',
-            'color': 7
-        }
-    ).set_placement((mid_point.x + offset_x, mid_point.y + offset_y))
-
-def draw_smartbox(msp, bx, by, pole_name, acc_names, coords):
-    box_lines = [f"POLE: {pole_name}"] + [f"+ {n}" for n in acc_names] + [f"Lat: {coords[1]:.6f}", f"Lon: {coords[0]:.6f}"]
-    tx, ty = bx + 12, by + 12
-    msp.add_line((bx, by), (tx, ty), dxfattribs={'layer': '05_SMARTBOX', 'color': 1})
-    ch = 1.8
-    mtext = msp.add_mtext("\n".join(box_lines), dxfattribs={
-        'layer': '05_SMARTBOX',
-        'style': 'ARIAL_STD',
-        'char_height': ch,
-        'color': 1
-    })
-    mtext.set_location((tx, ty), attachment_point=7)
-    bw = max(len(l) for l in box_lines) * ch * 0.65
-    bh = len(box_lines) * ch * 1.6
-    pts = [(tx-1, ty+1), (tx+bw+2, ty+1), (tx+bw+2, ty-bh-1), (tx-1, ty-bh-1)]
-    msp.add_lwpolyline(pts, dxfattribs={'layer': '05_SMARTBOX', 'color': 1}, close=True)
-
-def add_span_labels(msp, cable_line, to_m_func):
-    coords = cable_line['coords']
-    m_coords = [to_m_func(lon, lat) for lon, lat in coords]
-    for i in range(len(m_coords)-1):
-        p1 = m_coords[i]
-        p2 = m_coords[i+1]
-        dist = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-        if dist > 0.5:
-            mid = ((p1[0]+p2[0])/2, (p1[1]+p2[1])/2)
-            angle = math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0]))
-            if angle > 90: angle -= 180
-            if angle < -90: angle += 180
-            msp.add_text(
-                f"{dist:.0f}m",
-                dxfattribs={'layer': '03_KABEL', 'height': 1.2, 'rotation': angle, 'color': 5, 'style': 'ARIAL_STD'}
-            ).set_placement(mid)
-
-def get_model_bounding_box(msp):
-    min_x = min_y = float('inf')
-    max_x = max_y = float('-inf')
-    for entity in msp:
-        if entity.dxftype() == 'LWPOLYLINE':
-            for pt in entity.get_points():
-                x, y = pt[0], pt[1]
-                min_x = min(min_x, x); min_y = min(min_y, y)
-                max_x = max(max_x, x); max_y = max(max_y, y)
-        elif entity.dxftype() == 'LINE':
-            x1, y1, x2, y2 = entity.dxf.start.x, entity.dxf.start.y, entity.dxf.end.x, entity.dxf.end.y
-            min_x = min(min_x, x1, x2); min_y = min(min_y, y1, y2)
-            max_x = max(max_x, x1, x2); max_y = max(max_y, y1, y2)
-        elif entity.dxftype() == 'CIRCLE':
-            x, y, r = entity.dxf.center.x, entity.dxf.center.y, entity.dxf.radius
-            min_x = min(min_x, x-r); min_y = min(min_y, y-r)
-            max_x = max(max_x, x+r); max_y = max(max_y, y+r)
-        elif entity.dxftype() in ('TEXT', 'MTEXT'):
-            x, y = entity.dxf.insert.x, entity.dxf.insert.y
-            min_x = min(min_x, x); min_y = min(min_y, y)
-            max_x = max(max_x, x); max_y = max(max_y, y)
-    if min_x == float('inf'):
-        return (0, 0, 1, 1)
-    pad_x = (max_x - min_x) * 0.1 if max_x != min_x else 1
-    pad_y = (max_y - min_y) * 0.1 if max_y != min_y else 1
-    return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
-
-# ==============================================================================
-# FUNGSI CREATE_LAYOUT (TITLE BLOCK STANDAR IFORTE - PERFEKSIONIS FIX)
-# ==============================================================================
-def create_layout(doc, msp, model_bbox, meta):
-    """Buat Layout A3 dengan Title Block Standar iFORTE Presisi"""
-    if 'Gambar Utama' in doc.layouts:
-        doc.layouts.delete('Gambar Utama')
-
-    layout = doc.layouts.new('Gambar Utama')
-
-    paper_width = 420.0   # mm
-    paper_height = 297.0  # mm
-
-    layout.page_setup(size=(paper_width, paper_height), units='mm', margins=(0, 0, 0, 0))
-
-    # ===== BORDER KERTAS =====
-    margin = 10
-    frame = [(margin, margin), (paper_width-margin, margin),
-             (paper_width-margin, paper_height-margin), (margin, paper_height-margin)]
-    layout.add_lwpolyline(frame, close=True, dxfattribs={'layer': 'FRAME', 'color': 7, 'lineweight': 35})
-
-    # ===== VIEWPORT UTAMA =====
-    vp_x1, vp_y1 = 20, 20
-    vp_x2, vp_y2 = 280, 260   # mm
-
-    min_x, min_y, max_x, max_y = model_bbox
-    model_w = max_x - min_x
-    model_h = max_y - min_y
-    if model_w < 1e-6: model_w = 1
-    if model_h < 1e-6: model_h = 1
-
-    viewport_w = vp_x2 - vp_x1
-    viewport_h = vp_y2 - vp_y1
-    scale_x = viewport_w / model_w * 0.85
-    scale_y = viewport_h / model_h * 0.85
-    scale = min(scale_x, scale_y)
-
-    center_vp_x = (vp_x1 + vp_x2) / 2
-    center_vp_y = (vp_y1 + vp_y2) / 2
-    model_center_x = (min_x + max_x) / 2
-    model_center_y = (min_y + max_y) / 2
-    view_height = viewport_h / scale
-
-    viewport = layout.add_viewport(
-        center=(center_vp_x, center_vp_y),
-        size=(viewport_w, viewport_h),
-        view_height=view_height,
-        view_center_point=(model_center_x, model_center_y)
-    )
-    viewport.dxf.layer = 'VIEWPORT'
-    viewport.dxf.color = 7
-
-    # ===== TITLE BLOCK STANDAR IFORTE =====
-    tb_x1 = 285
-    tb_y1 = 10
-    tb_x2 = paper_width - margin  # 410
-    tb_y2 = paper_height - margin # 287
-
-    # Outer Frame Title Block
-    layout.add_lwpolyline([(tb_x1, tb_y1), (tb_x2, tb_y1), (tb_x2, tb_y2), (tb_x1, tb_y2)],
-                          close=True, dxfattribs={'layer': 'TITLE', 'color': 7, 'lineweight': 25})
-
-    def add_txt(text, x, y, height=2.5, color=7, align_center=False):
-        t = layout.add_text(text, dxfattribs={'layer': 'TITLE', 'height': height, 'color': color, 'style': 'ARIAL_STD'})
-        if align_center:
-            # PERBAIKAN: Gunakan align dengan TextEntityAlignment.MIDDLE_CENTER
-            t.set_placement((x, y), align=TextEntityAlignment.MIDDLE_CENTER)
-        else:
-            t.set_placement((x, y))
-
-    # --- SEKSI SPAN NAME ---
-    layout.add_line((tb_x1, tb_y2-20), (tb_x2, tb_y2-20), dxfattribs={'layer': 'TITLE', 'color': 7})
-    add_txt("SPAN NAME :", tb_x1+3, tb_y2-5, height=2.0)
-    add_txt(meta['span_name'], (tb_x1+tb_x2)/2, tb_y2-13, height=2.5, align_center=True)
-
-    # --- SEKSI NAME OF PROJECT ---
-    layout.add_line((tb_x1, tb_y2-45), (tb_x2, tb_y2-45), dxfattribs={'layer': 'TITLE', 'color': 7})
-    add_txt("NAME OF PROJECT :", tb_x1+3, tb_y2-25, height=2.0)
-    add_txt(meta['project_name'], (tb_x1+tb_x2)/2, tb_y2-33, height=3.0, align_center=True)
-    add_txt(meta['project_code'], (tb_x1+tb_x2)/2, tb_y2-40, height=2.5, align_center=True)
-
-    # --- SEKSI REVISION & APPROVAL TABLE ---
-    layout.add_line((tb_x1, tb_y2-60), (tb_x2, tb_y2-60), dxfattribs={'layer': 'TITLE', 'color': 7})
-    add_txt("REVISION", tb_x1+3, tb_y2-52, height=2.0)
-    
-    x_col1 = tb_x1 + 30
-    x_col2 = tb_x1 + 75
-    x_col3 = tb_x1 + 100
-    
-    layout.add_line((x_col1, tb_y2-45), (x_col1, tb_y2-110), dxfattribs={'layer': 'TITLE', 'color': 7})
-    layout.add_line((x_col2, tb_y2-45), (x_col2, tb_y2-110), dxfattribs={'layer': 'TITLE', 'color': 7})
-    layout.add_line((x_col3, tb_y2-45), (x_col3, tb_y2-110), dxfattribs={'layer': 'TITLE', 'color': 7})
-
-    add_txt("INITIAL NAME", x_col1+5, tb_y2-52, height=1.8)
-    add_txt("DATE", x_col2+5, tb_y2-52, height=1.8)
-    add_txt("SIGN", x_col3+5, tb_y2-52, height=1.8)
-
-    # Baris DRAWN BY
-    layout.add_line((tb_x1, tb_y2-75), (tb_x2, tb_y2-75), dxfattribs={'layer': 'TITLE', 'color': 7})
-    add_txt("DRAWN BY", x_col1-25, tb_y2-70, height=1.8)
-    add_txt(meta['drawn_by'], x_col1+5, tb_y2-70, height=2.0)
-    add_txt(meta['date_str'], x_col2+2, tb_y2-70, height=1.8)
-
-    # Baris CHECKED BY
-    layout.add_line((tb_x1, tb_y2-90), (tb_x2, tb_y2-90), dxfattribs={'layer': 'TITLE', 'color': 7})
-    add_txt("CHECKED BY", x_col1-27, tb_y2-85, height=1.8)
-    add_txt(meta['checked_by'], x_col1+5, tb_y2-85, height=2.0)
-    add_txt(meta['date_str'], x_col2+2, tb_y2-85, height=1.8)
-
-    # Baris APPROVED BY
-    layout.add_line((tb_x1, tb_y2-105), (tb_x2, tb_y2-105), dxfattribs={'layer': 'TITLE', 'color': 7})
-    add_txt("APPROVED BY", x_col1-28, tb_y2-100, height=1.8)
-    add_txt(meta['approved_by'], x_col1+5, tb_y2-100, height=2.0)
-    add_txt(meta['date_str'], x_col2+2, tb_y2-100, height=1.8)
-
-    # --- SEKSI SCALE & PAGE ---
-    x_scale_col = tb_x1 + 80
-    layout.add_line((x_scale_col, tb_y2-105), (x_scale_col, tb_y1), dxfattribs={'layer': 'TITLE', 'color': 7})
-    layout.add_line((tb_x1, tb_y2-120), (tb_x2, tb_y2-120), dxfattribs={'layer': 'TITLE', 'color': 7})
-    
-    add_txt("SCALE", x_scale_col+2, tb_y2-110, height=1.8)
-    add_txt(meta['scale_val'], x_scale_col+2, tb_y2-117, height=2.0)
-
-    layout.add_line((tb_x1, tb_y2-135), (tb_x2, tb_y2-135), dxfattribs={'layer': 'TITLE', 'color': 7})
-    add_txt("PAGE", x_scale_col+2, tb_y2-125, height=1.8)
-    add_txt(meta['page_val'], x_scale_col+2, tb_y2-132, height=2.0)
-
-    # ===== LEGENDA =====
-    leg_x1 = tb_x1
-    leg_y1 = tb_y1 + 10
-    leg_x2 = tb_x2 - 5
-    leg_y2 = leg_y1 + 50
-    layout.add_lwpolyline([(leg_x1, leg_y1), (leg_x2, leg_y1), (leg_x2, leg_y2), (leg_x1, leg_y2)],
-                          close=True, dxfattribs={'layer': 'LEGEND', 'color': 7})
-    add_txt("LEGENDA", leg_x1+5, leg_y2-4, height=2.5, color=1)
-
-    items = [
-        ("Kabel Serat Optik", "03_KABEL", 5),
-        ("Tiang Telekom", "04_POLE", 7),
-        ("Closure / Slack", "05_SMARTBOX", 1),
-        ("Badan Jalan", "01_BADAN_JALAN", 8)
-    ]
-    yy = leg_y2 - 10
-    for label, layer, color in items:
-        add_txt(f"• {label}", leg_x1+5, yy, height=2.0, color=color)
-        yy -= 5
-
-    # ===== KEY MAP =====
-    km_x1, km_y1 = 20, 20
-    km_x2, km_y2 = 80, 60
-    km_viewport = layout.add_viewport(
-        center=((km_x1+km_x2)/2, (km_y1+km_y2)/2),
-        size=(km_x2-km_x1, km_y2-km_y1),
-        view_height=view_height * 3,
-        view_center_point=(model_center_x, model_center_y)
-    )
-    km_viewport.dxf.layer = 'KEYMAP'
-    km_viewport.dxf.color = 7
-    layout.add_lwpolyline([(km_x1, km_y1), (km_x2, km_y1), (km_x2, km_y2), (km_x1, km_y2)],
-                          close=True, dxfattribs={'layer': 'KEYMAP', 'color': 7})
-    add_txt("KEY MAP", km_x1+2, km_y2-3, height=2.0, color=7)
-
-    # ===== LOGO PLACEHOLDER =====
-    add_txt("PT. Rizki Prima Sakti", tb_x1+5, tb_y1+5, height=2.2, color=4)
-    add_txt("Client: iFORTE", tb_x1+5, tb_y1+10, height=2.2, color=4)
-
-# ==============================================================================
-# INSPECTOR ENGINE
-# ==============================================================================
-def inspect_cad_precision(data, road_labels_data):
-    issues = []
-    for idx, lbl in enumerate(road_labels_data):
-        name = lbl.get('name', '')
-        if pd.isna(name) or str(name).lower() == 'nan' or not str(name).strip():
-            issues.append({
-                'level': '❌ ERROR',
-                'category': 'Atribut Teks',
-                'detail': f"Ruas Jalan #{idx+1} memiliki label bernilai NaN / Kosong."
+        # Peringatan Precision & Quality Inspector jika bertumpuk
+        if coord_key in coord_tracker:
+            inspector_logs.append({
+                'level': 'WARNING',
+                'category': 'Overlap Geometry',
+                'detail': f"Tiang '{p['name']}' bertumpuk persis dengan '{coord_tracker[coord_key]}'"
             })
-    points = data.get('points', [])
-    for i in range(len(points)):
-        for j in range(i + 1, len(points)):
-            p1 = points[i]['geom']
-            p2 = points[j]['geom']
-            if p1.distance(p2) < 0.000001:
-                issues.append({
-                    'level': '⚠️ WARNING',
-                    'category': 'Overlap Geometry',
-                    'detail': f"Tiang '{points[i]['name']}' bertumpuk persis dengan '{points[j]['name']}'."
-                })
-    lines = data.get('lines', [])
-    if lines and points:
-        all_pole_geoms = [p['geom'] for p in points]
-        for line in lines:
-            ls = line['geom']
-            start_pt = Point(ls.coords[0])
-            end_pt = Point(ls.coords[-1])
-            min_dist_start = min([start_pt.distance(p) for p in all_pole_geoms]) * 111000
-            min_dist_end = min([end_pt.distance(p) for p in all_pole_geoms]) * 111000
-            if min_dist_start > 2.0:
-                issues.append({
-                    'level': '⚠️ WARNING',
-                    'category': 'Presisi Kabel',
-                    'detail': f"Ujung awal Kabel '{line['name']}' tidak menempel ke tiang (>2m)."
-                })
-            if min_dist_end > 2.0:
-                issues.append({
-                    'level': '⚠️ WARNING',
-                    'category': 'Presisi Kabel',
-                    'detail': f"Ujung akhir Kabel '{line['name']}' tidak menempel ke tiang (>2m)."
-                })
-    return issues
+        else:
+            coord_tracker[coord_key] = p['name']
 
-# ==============================================================================
-# PREVIEW CANVAS
-# ==============================================================================
-def render_compact_viewport(data, road_polygons, to_m_func):
-    fig, ax = plt.subplots(figsize=(5, 5), facecolor='#0e1117')
-    ax.set_facecolor('#0e1117')
+        converted_poles.append({
+            'name': p['name'],
+            'coords': (mx, my),
+            'has_accessories': p['has_accessories'],
+            'is_overlap': coord_key in coord_tracker
+        })
 
-    if road_polygons:
-        for poly in road_polygons:
-            if isinstance(poly, Polygon):
-                x, y = poly.exterior.xy
-                ax.plot(x, y, color='#555555', linewidth=0.8, alpha=0.8)
-            elif isinstance(poly, MultiPolygon):
-                for p in poly.geoms:
-                    x, y = p.exterior.xy
-                    ax.plot(x, y, color='#555555', linewidth=0.8, alpha=0.8)
+    return {
+        'cables': converted_cables,
+        'poles': converted_poles,
+        'inspector': inspector_logs
+    }
 
-    for line in data['lines']:
-        m_coords = [to_m_func(c[0], c[1]) for c in line['coords']]
-        xs, ys = zip(*m_coords)
-        ax.plot(xs, ys, color='#00a8ff', linewidth=1.5, zorder=3)
+# ==========================================
+# 2. DXF GENERATOR ENGINE (PERFEKSIONIS)
+# ==========================================
 
-    for pt in data['points']:
-        mx, my = to_m_func(pt['orig'][0], pt['orig'][1])
-        ax.scatter(mx, my, color='#ff4757', s=18, zorder=5)
+def build_dxf_document(parsed_data, proj_info, road_width=6.0):
+    doc = ezdxf.new(dxfversion='AC1027')
+    doc.header['$INSUNITS'] = units.MM
 
-    ax.set_aspect('equal', adjustable='datalim')
-    ax.tick_params(colors='#888888', labelsize=7)
-    ax.grid(True, color='#222222', linestyle=':', linewidth=0.5)
-    plt.title("Live Viewport Preview (CAD Canvas)", color='white', fontsize=10, pad=10)
-    plt.tight_layout()
-    return fig
+    # Setup Layering & Lineweight
+    layers = doc.layers
+    layers.add("01_BADAN_JALAN", color=8, lineweight=13)
+    layers.add("03_KABEL_FO", color=1, lineweight=50)
+    layers.add("04_POLE_TIANG", color=3, lineweight=30)
+    layers.add("05_SMARTBOX_SLACK", color=2, lineweight=25)
+    layers.add("KOP_TITLE_BLOCK", color=7, lineweight=25)
 
-# ==============================================================================
-# MAIN APP
-# ==============================================================================
-st.title("⚡ ASPLAN PRO v12.1")
-st.subheader("Interactive CAD Converter with Dynamic Title Block")
+    msp = doc.modelspace()
+    all_x, all_y = [], []
 
-uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
+    # A. Render Kabel & Koridor Jalan
+    for cable in parsed_data['cables']:
+        pts = cable['coords']
+        if len(pts) < 2:
+            continue
+        for pt in pts:
+            all_x.append(pt[0])
+            all_y.append(pt[1])
 
-if uploaded_files:
-    for idx, file in enumerate(uploaded_files):
-        st.divider()
-        st.markdown(f"### 📦 File: `{file.name}`")
+        msp.add_lwpolyline(pts, dxfattribs={'layer': '03_KABEL_FO'})
 
-        try:
-            kmz_bytes = file.read()
-            with ZipFile(io.BytesIO(kmz_bytes), 'r') as zf:
-                kml_files = [n for n in zf.namelist() if n.endswith('.kml')]
-                if not kml_files:
-                    st.error("Tidak ada file KML di dalam KMZ.")
-                    continue
-                with zf.open(kml_files[0]) as f:
-                    data = parse_kml_brute_force(f.read())
+        # Peta Jalan Otomatis
+        left_b, right_b = generate_corridor_polylines(pts, width=road_width)
+        if left_b:
+            msp.add_lwpolyline(left_b, dxfattribs={'layer': '01_BADAN_JALAN'})
+        if right_b:
+            msp.add_lwpolyline(right_b, dxfattribs={'layer': '01_BADAN_JALAN'})
 
-            if not data['lines'] and not data['points']:
-                st.warning("⚠️ File ini tidak memiliki data garis atau titik yang bisa diproses.")
-                continue
+    # B. Render Tiang & Terapkan Aturan Bisnis Kak Donny
+    for p in parsed_data['poles']:
+        pos = p['coords']
+        name = p['name']
+        all_x.append(pos[0])
+        all_y.append(pos[1])
 
-            st.caption(f"📊 Ditemukan {len(data['lines'])} segmen kabel dan {len(data['points'])} tiang.")
+        # Gambar Tiang (Bila overlap, tetap digambar)
+        msp.add_circle(pos, radius=0.8, dxfattribs={'layer': '04_POLE_TIANG'})
 
-            center_lat, center_lon = get_center_point_from_kml(data)
-            if center_lat is None or center_lon is None:
-                st.error("Tidak dapat menentukan titik tengah. Pastikan ada data koordinat.")
-                continue
+        # Aturan Aksesoris -> Smartbox & "New Slack Support"
+        text_y_offset = 0.8
+        if p['has_accessories']:
+            msp.add_rectangle4p([
+                (pos[0]-1.2, pos[1]-1.2), (pos[0]+1.2, pos[1]-1.2),
+                (pos[0]+1.2, pos[1]+1.2), (pos[0]-1.2, pos[1]+1.2)
+            ], dxfattribs={'layer': '05_SMARTBOX_SLACK'})
 
-            cable_length_deg = sum([
-                math.sqrt((l['coords'][-1][0]-l['coords'][0][0])**2 + (l['coords'][-1][1]-l['coords'][0][1])**2)
-                for l in data['lines'] if len(l['coords']) >= 2
-            ])
-            cable_length_meters = cable_length_deg * 111000
-            download_radius = max(cable_length_meters / 2, 1000) + 1000
+            msp.add_text("New Slack Support", dxfattribs={
+                'layer': '05_SMARTBOX_SLACK', 'height': 0.8
+            }).set_placement((pos[0] + 1.8, pos[1] - 0.5))
 
-            m_lat = 111320
-            m_lon = 111320 * math.cos(math.radians(center_lat))
-            def to_m(lon, lat): return ((lon - center_lon) * m_lon, (lat - center_lat) * m_lat)
+        # Aturan Penamaan Closure (cls48 -> New Closure 48C / cl24 -> New Closure 24)
+        lower_name = name.lower()
+        if 'cls' in lower_name or 'cl' in lower_name:
+            clean_name = name.replace('cls', 'New Closure ').replace('cl', 'New Closure ')
+            if '48' in clean_name and not clean_name.endswith('C'):
+                clean_name += 'C'
+            display_name = clean_name
+        else:
+            display_name = name
 
-            # Download OSM Roads
-            road_polygons = []
-            road_labels_data = []
-            try:
-                graph = ox.graph_from_point((center_lat, center_lon), dist=download_radius, network_type='all', simplify=True)
-                _, edges = ox.graph_to_gdfs(graph)
-                if not edges.empty:
-                    cable_pts_m = [to_m(c[0], c[1]) for line in data['lines'] for c in line['coords']]
-                    for _, row in edges.iterrows():
-                        highway = row.get('highway', '')
-                        if isinstance(highway, list): highway = highway[0] if highway else ''
-                        if not highway: continue
+        # Jika overlap, beri sedikit offset teks vertikal agar tidak menumpuk total
+        if p.get('is_overlap'):
+            text_y_offset += 1.2
 
-                        lines_geom = list(row.geometry.geoms) if row.geometry.geom_type == 'MultiLineString' else [row.geometry]
-                        for line in lines_geom:
-                            if line.geom_type != 'LineString': continue
-                            m_coords = [to_m(c[0], c[1]) for c in line.coords]
-                            if len(m_coords) < 2: continue
+        msp.add_text(display_name, dxfattribs={
+            'layer': '04_POLE_TIANG', 'height': 0.9
+        }).set_placement((pos[0] + 1.8, pos[1] + text_y_offset))
 
-                            line_shapely = LineString(m_coords)
-                            if min(line_shapely.distance(Point(cp)) for cp in cable_pts_m) > 200: continue
+    # C. Dynamic Viewport A3 Layout Space
+    layout = doc.layouts.get("Paper_A3_Presentation")
+    layout.page_setup(size=(420, 297), unit="mm")
 
-                            poly = create_road_buffer_fixed(m_coords, ROAD_WIDTHS.get(highway, 8.0))
-                            if poly:
-                                road_polygons.append(poly)
-                                r_name = row.get('name', '') or row.get('ref', '')
-                                if r_name and not pd.isna(r_name):
-                                    road_labels_data.append({'coords': m_coords, 'name': str(r_name), 'length': line_shapely.length})
-            except Exception as e:
-                st.caption(f"Note OSM: {e}")
+    min_x, max_x = (min(all_x), max(all_x)) if all_x else (0, 100)
+    min_y, max_y = (min(all_y), max(all_y)) if all_y else (0, 100)
+    cx, cy = (min_x + max_x) / 2.0, (min_y + max_y) / 2.0
+    h = max_y - min_y or 100.0
 
-            # Layout 2 Kolom
-            col_view, col_inspect = st.columns([1, 1.2])
+    layout.add_viewport(
+        center=(160, 148),
+        size=(280.0, 200.0),
+        view_center_point=(cx, cy),
+        view_height=h * 1.18
+    )
 
-            with col_view:
-                st.markdown("#### 📐 Viewport Preview Box")
-                fig = render_compact_viewport(data, road_polygons, to_m)
-                st.pyplot(fig, use_container_width=False)
+    # D. Isi Informasi Kop Gambar dari Sidebar
+    layout.add_text(proj_info.get('span_name', ''), dxfattribs={'layer': 'KOP_TITLE_BLOCK', 'height': 3.5}).set_placement((315, 45))
+    layout.add_text(proj_info.get('project_code', ''), dxfattribs={'layer': 'KOP_TITLE_BLOCK', 'height': 3.5}).set_placement((315, 35))
+    layout.add_text(proj_info.get('drawn_by', 'RPS'), dxfattribs={'layer': 'KOP_TITLE_BLOCK', 'height': 3.0}).set_placement((345, 18))
+    layout.add_text(proj_info.get('checked_by', 'IFORTE'), dxfattribs={'layer': 'KOP_TITLE_BLOCK', 'height': 3.0}).set_placement((345, 12))
 
-            with col_inspect:
-                st.markdown("#### 🔍 Precision & Quality Inspector")
-                issues = inspect_cad_precision(data, road_labels_data)
-                if not issues:
-                    st.success("✅ **Gambar Sempurna!** Tidak ditemukan kesalahan presisi.")
-                else:
-                    st.warning(f"⚠️ Ditemukan **{len(issues)} potensi kesalahan presisi**:")
-                    df_issues = pd.DataFrame(issues)
-                    st.dataframe(df_issues, use_container_width=True, hide_index=True)
+    out_bytes = io.StringIO()
+    doc.write(out_bytes)
+    return out_bytes.getvalue()
 
-            # ===== BUILD DXF =====
-            doc = ezdxf.new(setup=True)
-            doc.styles.new("ARIAL_STD", dxfattribs={"font": "arial.ttf"})
-            msp = doc.modelspace()
+# ==========================================
+# 3. STREAMLIT UI INTERFACE
+# ==========================================
 
-            for l_name, col in {'01_BADAN_JALAN': 8, '02_NAMA_JALAN': 7, '03_KABEL': 5, '04_POLE': 7, '05_SMARTBOX': 1, 'FRAME': 7, 'TITLE': 7, 'LEGEND': 7, 'KEYMAP': 7, 'VIEWPORT': 7}.items():
-                doc.layers.new(l_name, dxfattribs={'color': col})
+# Sidebar Forms
+st.sidebar.title("📇 Informasi Proyek (Kop Gambar)")
+span_name = st.sidebar.text_input("SPAN NAME", "14PBG007_REMBANGPBLG - 14PBG03...")
+name_project = st.sidebar.text_input("NAME OF PROJECT", "AS BUILD")
+project_code = st.sidebar.text_input("PROJECT CODE / REVISION CODE", "RM-26-000327")
 
-            # 1. Jalan
-            if road_polygons:
-                merged = unary_union(road_polygons)
-                polys = merged.geoms if isinstance(merged, MultiPolygon) else [merged]
-                for p in polys:
-                    if isinstance(p, Polygon) and p.exterior:
-                        msp.add_lwpolyline(list(p.exterior.coords), dxfattribs={'layer': '01_BADAN_JALAN', 'color': 8}, close=True)
+st.sidebar.title("✍️ Personel & Otorisasi")
+drawn_by = st.sidebar.text_input("DRAWN BY (Initial)", "RPS")
+checked_by = st.sidebar.text_input("CHECKED BY (Initial)", "IFORTE")
+approved_by = st.sidebar.text_input("APPROVED BY (Initial)", "IFORTE")
 
-            # 2. Label Jalan
-            for lbl in road_labels_data:
-                add_road_label(msp, lbl['coords'], lbl['name'], '02_NAMA_JALAN')
+st.sidebar.title("⚙️ Parameter Gambar")
+revision = st.sidebar.text_input("REVISION", "0")
 
-            # 3. Kabel
-            for line in data['lines']:
-                m_coords = [to_m(c[0], c[1]) for c in line['coords']]
-                msp.add_lwpolyline(m_coords, dxfattribs={'layer': '03_KABEL', 'color': 5, 'lineweight': 40})
-                add_span_labels(msp, line, to_m)
+# Main Content
+st.title("ASPLAN PRO v12.1 - KMZ to DXF Converter")
 
-            # 4. Tiang & Aksesoris
-            pt_a = data['points'][0]['name'] if data['points'] else ""
-            pt_b = data['points'][-1]['name'] if data['points'] else ""
+uploaded_file = st.file_uploader("Upload File KMZ Proyek", type=['kmz'])
 
-            for pt in data['points']:
-                mx, my = to_m(pt['orig'][0], pt['orig'][1])
-                p_name = pt['name']
-                display_name = smart_rename(p_name)
-                is_accessory = (display_name != p_name) and display_name != ""
+if uploaded_file:
+    parsed = parse_kmz(uploaded_file.read())
+    
+    st.subheader(f"📦 File: {uploaded_file.name}")
+    st.write(f"Ditemukan {len(parsed['cables'])} segmen kabel dan {len(parsed['poles'])} tiang.")
 
-                if not any(x in p_name.upper() for x in ["ODP", "OTB"]):
-                    msp.add_circle((mx, my), 1.5, dxfattribs={'layer': '04_POLE', 'color': 7})
+    col1, col2 = st.columns([1, 1])
 
-                if is_accessory or p_name in [pt_a, pt_b] or any(x in p_name.upper() for x in ["ODP", "OTB"]):
-                    acc_list = [display_name] if is_accessory else []
-                    draw_smartbox(msp, mx, my, p_name, acc_list, pt['orig'])
-                else:
-                    msp.add_text(p_name, dxfattribs={'layer': '04_POLE', 'height': 2.0, 'style': 'ARIAL_STD', 'color': 7}).set_placement((mx + 3, my + 3))
+    with col1:
+        st.markdown("### 📐 Viewport Preview Box")
+        fig, ax = plt.subplots(figsize=(6, 5))
+        ax.set_facecolor('#0e1117')
+        fig.patch.set_facecolor('#0e1117')
 
-            # ===== LAYOUT (PAPERSPACE) =====
-            if include_layout:
-                model_bbox = get_model_bounding_box(msp)
-                meta = {
-                    'span_name': span_name,
-                    'project_name': project_name,
-                    'project_code': project_code,
-                    'drawn_by': drawn_by,
-                    'checked_by': checked_by,
-                    'approved_by': approved_by,
-                    'revision': revision_val,
-                    'scale_val': scale_val,
-                    'page_val': page_val,
-                    'date_str': date_val.strftime("%d-%m-%Y")
-                }
-                create_layout(doc, msp, model_bbox, meta)
+        # Preview Plot Kabel
+        for c in parsed['cables']:
+            xs = [pt[0] for pt in c['coords']]
+            ys = [pt[1] for pt in c['coords']]
+            ax.plot(xs, ys, color='#ff4b4b', linewidth=2)
 
-            # ===== OUTPUT =====
-            out_stream = io.StringIO()
-            doc.write(out_stream)
+        # Preview Plot Tiang
+        pxs = [p['coords'][0] for p in parsed['poles']]
+        pys = [p['coords'][1] for p in parsed['poles']]
+        ax.scatter(pxs, pys, color='#00ff7f', s=15)
 
-            output_filename = file.name.replace('.kmz', f'_FIXED_{datetime.now().strftime("%Y%m%d_%H%M%S")}.dxf')
-            st.download_button(
-                label=f"💾 Download DXF ({'dengan Layout' if include_layout else 'tanpa Layout'}) - {file.name}",
-                data=out_stream.getvalue(),
-                file_name=output_filename,
-                mime="application/dxf",
-                type="primary"
-            )
+        ax.tick_params(colors='white')
+        ax.grid(True, color='#333333', linestyle='--')
+        st.pyplot(fig)
 
-        except Exception as e:
-            st.error(f"Gagal memproses file: {e}")
+    with col2:
+        st.markdown("### 🔍 Precision & Quality Inspector")
+        if parsed['inspector']:
+            st.warning(f"Ditemukan {len(parsed['inspector'])} potensi kesalahan presisi:")
+            st.table(parsed['inspector'])
+        else:
+            st.success("Semua geometri presisi! Tidak ditemukan tumpukan tiang.")
+
+    # Generate DXF Button
+    proj_data = {
+        'span_name': span_name,
+        'project_code': project_code,
+        'drawn_by': drawn_by,
+        'checked_by': checked_by
+    }
+    
+    dxf_string = build_dxf_document(parsed, proj_data)
+
+    st.download_button(
+        label=f"💾 Download DXF (dengan Layout) - {uploaded_file.name}.dxf",
+        data=dxf_string,
+        file_name=f"{uploaded_file.name}.dxf",
+        mime="application/dxf"
+    )
