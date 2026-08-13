@@ -292,7 +292,7 @@ def create_layout(doc, msp, model_bbox, meta):
     )
     viewport.dxf.layer = 'VIEWPORT'
     viewport.dxf.color = 7
-    viewport.dxf.on = False
+
 
     # ===== TITLE BLOCK =====
     tb_x1 = 295
@@ -356,7 +356,7 @@ def create_layout(doc, msp, model_bbox, meta):
     )
     km_viewport.dxf.layer = 'KEYMAP'
     km_viewport.dxf.color = 7
-    km_viewport.dxf.on = False
+
     layout.add_lwpolyline([(km_x1, km_y1), (km_x2, km_y1), (km_x2, km_y2), (km_x1, km_y2)],
                           close=True, dxfattribs={'layer': 'KEYMAP', 'color': 7})
     add_text(layout, "KEY MAP", km_x1+2, km_y2-3, height=2, color=7)
