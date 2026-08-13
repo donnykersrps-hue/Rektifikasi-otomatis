@@ -18,14 +18,14 @@ import numpy as np
 # CONFIG & PAGE SETUP
 # ==============================================================================
 st.set_page_config(
-    page_title="ASPLAN PRO v11.0 - KMZ to DXF Converter & Layout Generator",
+    page_title="ASPLAN PRO v11.1 - KMZ to DXF Converter & Layout Generator",
     page_icon="🗺️",
     layout="wide"
 )
 
 ox.settings.use_cache = True
 ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v11.0"
+ox.settings.user_agent = "AsplanPro_v11.1"
 
 ROAD_WIDTHS = {
     'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
@@ -37,7 +37,7 @@ ROAD_WIDTHS = {
 # SIDEBAR - METADATA PROYEK
 # ==============================================================================
 with st.sidebar:
-    st.image("https://via.placeholder.com/150x50?text=LOGO", use_container_width=True)  # placeholder logo
+    st.image("https://via.placeholder.com/150x50?text=LOGO", use_container_width=True)
     st.header("📋 Informasi Proyek")
     project_name = st.text_input("Nama Proyek", "AS-BUILT FIBER OPTIC")
     span_name = st.text_input("Nama Ruas / Span", "Ruas A - B")
@@ -46,7 +46,7 @@ with st.sidebar:
     date = st.date_input("Tanggal", datetime.now())
     include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
     st.markdown("---")
-    st.caption("ASPLAN PRO v11.0 - © 2026")
+    st.caption("ASPLAN PRO v11.1 - © 2026")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -98,19 +98,30 @@ def parse_kml_brute_force(kml_bytes):
     return features
 
 def smart_rename(name):
-    """Rename paten untuk aksesoris"""
+    """Logika penamaan aksesoris sesuai permintaan: Closure -> New Closure [X]C, Slack/SS/Hanger -> New Slack Support"""
     if not name or pd.isna(name):
         return ""
     n = str(name).upper().strip()
-    if any(x in n for x in ["SLACK", ".SS", "SS"]):
-        return "New Slack Support"
-    if any(x in n for x in ["CLOS", "CL24", "CL48", "CL96", "CLS", "C24", "C48", "C96"]):
+
+    # Deteksi Closure (prioritas karena bisa mengandung angka)
+    if any(x in n for x in ["CLOS", "CLOSURE", "CL", "C"]):
         numbers = re.findall(r'\d+', n)
-        num = max([int(x) for x in numbers]) if numbers else ""
-        return f"New Closure {num}C" if num else "New Closure"
+        if numbers:
+            num = max(int(x) for x in numbers)  # ambil angka terbesar
+            return f"New Closure {num}C"
+        else:
+            return "New Closure"
+
+    # Deteksi Slack / SS / Hanger
+    if any(x in n for x in ["SLACK", ".SS", "SS", "HANGER"]):
+        return "New Slack Support"
+
+    # default: kembalikan nama asli (tidak diubah)
     return name
 
 def get_center_point_from_kml(data):
+    if not data['lines'] and not data['points']:
+        return None, None
     if not data['lines']:
         lats = [p['orig'][1] for p in data['points']]
         lons = [p['orig'][0] for p in data['points']]
@@ -206,47 +217,32 @@ def add_span_labels(msp, cable_line, to_m_func):
             ).set_placement(mid)
 
 def get_model_bounding_box(msp):
-    """Scan entitas di modelspace untuk mendapatkan bounding box (meter)"""
+    """Scan entitas di modelspace untuk mendapatkan bounding box (meter) - sudah diperbaiki untuk LWPOLYLINE"""
     min_x = min_y = float('inf')
     max_x = max_y = float('-inf')
-    # Iterasi semua entitas (sederhana: ambil dari vertex)
     for entity in msp:
         if entity.dxftype() == 'LWPOLYLINE':
-            points = list(entity.get_points())
-            for x, y in points:
-                min_x = min(min_x, x)
-                min_y = min(min_y, y)
-                max_x = max(max_x, x)
-                max_y = max(max_y, y)
+            # get_points() mengembalikan list of (x, y, start_width, end_width, bulge)
+            for pt in entity.get_points():
+                x, y = pt[0], pt[1]   # ambil 2 elemen pertama
+                min_x = min(min_x, x); min_y = min(min_y, y)
+                max_x = max(max_x, x); max_y = max(max_y, y)
         elif entity.dxftype() == 'LINE':
             x1, y1, x2, y2 = entity.dxf.start.x, entity.dxf.start.y, entity.dxf.end.x, entity.dxf.end.y
-            min_x = min(min_x, x1, x2)
-            min_y = min(min_y, y1, y2)
-            max_x = max(max_x, x1, x2)
-            max_y = max(max_y, y1, y2)
+            min_x = min(min_x, x1, x2); min_y = min(min_y, y1, y2)
+            max_x = max(max_x, x1, x2); max_y = max(max_y, y1, y2)
         elif entity.dxftype() == 'CIRCLE':
             x, y, r = entity.dxf.center.x, entity.dxf.center.y, entity.dxf.radius
-            min_x = min(min_x, x-r)
-            min_y = min(min_y, y-r)
-            max_x = max(max_x, x+r)
-            max_y = max(max_y, y+r)
-        elif entity.dxftype() == 'TEXT':
+            min_x = min(min_x, x-r); min_y = min(min_y, y-r)
+            max_x = max(max_x, x+r); max_y = max(max_y, y+r)
+        elif entity.dxftype() in ('TEXT', 'MTEXT'):
             x, y = entity.dxf.insert.x, entity.dxf.insert.y
-            min_x = min(min_x, x)
-            min_y = min(min_y, y)
-            max_x = max(max_x, x)
-            max_y = max(max_y, y)
-        elif entity.dxftype() == 'MTEXT':
-            x, y = entity.dxf.insert.x, entity.dxf.insert.y
-            min_x = min(min_x, x)
-            min_y = min(min_y, y)
-            max_x = max(max_x, x)
-            max_y = max(max_y, y)
+            min_x = min(min_x, x); min_y = min(min_y, y)
+            max_x = max(max_x, x); max_y = max(max_y, y)
     if min_x == float('inf'):
-        return (0,0,1,1)
-    # tambahkan padding 10%
-    pad_x = (max_x - min_x) * 0.1
-    pad_y = (max_y - min_y) * 0.1
+        return (0, 0, 1, 1)
+    pad_x = (max_x - min_x) * 0.1 if max_x != min_x else 1
+    pad_y = (max_y - min_y) * 0.1 if max_y != min_y else 1
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
 def create_layout(doc, msp, model_bbox, meta):
@@ -257,9 +253,6 @@ def create_layout(doc, msp, model_bbox, meta):
     layout.set_paper_size((paper_width, paper_height), 'mm')
     layout.set_plot_limits((0,0), (paper_width, paper_height))
 
-    # Warna latar putih (opsional)
-    layout.dxf.color = 7
-
     # ===== FRAME =====
     margin = 10
     frame = [(margin, margin), (paper_width-margin, margin),
@@ -267,15 +260,12 @@ def create_layout(doc, msp, model_bbox, meta):
     layout.add_lwpolyline(frame, close=True, dxfattribs={'layer': 'FRAME', 'color': 7, 'lineweight': 35})
 
     # ===== VIEWPORT =====
-    # Area viewport: kiri atas, menyisakan ruang untuk title block di kanan bawah
     vp_x1, vp_y1 = 20, 20
     vp_x2, vp_y2 = 280, 260   # mm
 
-    # Hitung skala agar model muat di viewport
     min_x, min_y, max_x, max_y = model_bbox
     model_w = max_x - min_x
     model_h = max_y - min_y
-    # Pastikan tidak nol
     if model_w < 1e-6: model_w = 1
     if model_h < 1e-6: model_h = 1
     viewport_w = vp_x2 - vp_x1
@@ -283,12 +273,10 @@ def create_layout(doc, msp, model_bbox, meta):
     scale_x = viewport_w / model_w * 0.85
     scale_y = viewport_h / model_h * 0.85
     scale = min(scale_x, scale_y)
-    # Pusat viewport
     center_vp_x = (vp_x1 + vp_x2) / 2
     center_vp_y = (vp_y1 + vp_y2) / 2
     model_center_x = (min_x + max_x) / 2
     model_center_y = (min_y + max_y) / 2
-    # Tinggi tampilan dalam unit model = (viewport_h / scale)
     view_height = viewport_h / scale
 
     viewport = layout.add_viewport(
@@ -299,20 +287,16 @@ def create_layout(doc, msp, model_bbox, meta):
     )
     viewport.dxf.layer = 'VIEWPORT'
     viewport.dxf.color = 7
-    # Sembunyikan border viewport
     viewport.dxf.on = False
 
     # ===== TITLE BLOCK =====
-    # Letakkan di kanan bawah
     tb_x1 = 295
     tb_y1 = 20
     tb_x2 = paper_width - margin
     tb_y2 = paper_height - margin
-    # Gambar border title block
     layout.add_lwpolyline([(tb_x1, tb_y1), (tb_x2, tb_y1), (tb_x2, tb_y2), (tb_x1, tb_y2)],
                           close=True, dxfattribs={'layer': 'TITLE', 'color': 7, 'lineweight': 25})
 
-    # Fungsi bantu untuk menulis teks
     def add_text(layout, text, x, y, height=2.5, layer='TITLE', color=7, style='ARIAL_STD'):
         layout.add_text(text, dxfattribs={'layer': layer, 'height': height, 'color': color, 'style': style}
                         ).set_placement((x, y))
@@ -321,7 +305,6 @@ def create_layout(doc, msp, model_bbox, meta):
     add_text(layout, "TECHNICAL DRAWING", tb_x1+5, y_pos, height=5, color=1)
     y_pos -= 10
 
-    # Baris proyek
     add_text(layout, f"Project : {meta['project']}", tb_x1+5, y_pos, height=3)
     y_pos -= 6
     add_text(layout, f"Span    : {meta['span']}", tb_x1+5, y_pos, height=3)
@@ -333,7 +316,6 @@ def create_layout(doc, msp, model_bbox, meta):
     add_text(layout, f"Scale   : 1:{int(scale*1000) if scale*1000>1 else 1}", tb_x1+5, y_pos, height=3)
     y_pos -= 8
 
-    # Garis pemisah
     layout.add_line((tb_x1, y_pos), (tb_x2, y_pos), dxfattribs={'layer': 'TITLE', 'color': 7})
     y_pos -= 4
     add_text(layout, "Verifier : " + meta['verifier'], tb_x1+5, y_pos, height=2.5)
@@ -345,12 +327,10 @@ def create_layout(doc, msp, model_bbox, meta):
     leg_y1 = tb_y1 + 10
     leg_x2 = tb_x2 - 5
     leg_y2 = leg_y1 + 60
-    # Border legenda
     layout.add_lwpolyline([(leg_x1, leg_y1), (leg_x2, leg_y1), (leg_x2, leg_y2), (leg_x1, leg_y2)],
                           close=True, dxfattribs={'layer': 'LEGEND', 'color': 7})
     add_text(layout, "LEGENDA", leg_x1+5, leg_y2-4, height=3, color=1)
 
-    # Simbol-simbol
     items = [
         ("Kabel Serat Optik", "03_KABEL", 5, "line"),
         ("Tiang Telekom", "04_POLE", 7, "circle"),
@@ -362,27 +342,23 @@ def create_layout(doc, msp, model_bbox, meta):
         add_text(layout, f"• {label}", leg_x1+5, yy, height=2.2, color=color)
         yy -= 5
 
-    # ===== KEY MAP (kecil) =====
-    # Buat viewport kecil di pojok kiri bawah untuk overview
+    # ===== KEY MAP =====
     km_x1, km_y1 = 20, 20
     km_x2, km_y2 = 80, 60
-    # Tampilkan model dengan skala yang lebih kecil (overview)
     km_viewport = layout.add_viewport(
         center=((km_x1+km_x2)/2, (km_y1+km_y2)/2),
         size=(km_x2-km_x1, km_y2-km_y1),
         view_center=(model_center_x, model_center_y),
-        view_height=view_height * 3   # lebih zoom out
+        view_height=view_height * 3
     )
     km_viewport.dxf.layer = 'KEYMAP'
     km_viewport.dxf.color = 7
     km_viewport.dxf.on = False
-    # Tambahkan border key map
     layout.add_lwpolyline([(km_x1, km_y1), (km_x2, km_y1), (km_x2, km_y2), (km_x1, km_y2)],
                           close=True, dxfattribs={'layer': 'KEYMAP', 'color': 7})
     add_text(layout, "KEY MAP", km_x1+2, km_y2-3, height=2, color=7)
 
     # ===== LOGO PLACEHOLDER =====
-    # Kita buat blok teks sederhana untuk logo
     add_text(layout, "PT. Rizki Prima Sakti", tb_x1+5, tb_y1+5, height=2.5, color=4)
     add_text(layout, "Client: iFORTE", tb_x1+5, tb_y1+10, height=2.5, color=4)
 
@@ -472,7 +448,7 @@ def render_compact_viewport(data, road_polygons, to_m_func):
 # ==============================================================================
 # MAIN APP
 # ==============================================================================
-st.title("⚡ ASPLAN PRO v11.0")
+st.title("⚡ ASPLAN PRO v11.1")
 st.subheader("Interactive CAD Converter with Layout & Precision Inspector")
 
 uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
@@ -492,7 +468,18 @@ if uploaded_files:
                 with zf.open(kml_files[0]) as f:
                     data = parse_kml_brute_force(f.read())
 
+            # Validasi data
+            if not data['lines'] and not data['points']:
+                st.warning("⚠️ File ini tidak memiliki data garis atau titik yang bisa diproses.")
+                continue
+
+            st.caption(f"📊 Ditemukan {len(data['lines'])} segmen kabel dan {len(data['points'])} tiang.")
+
             center_lat, center_lon = get_center_point_from_kml(data)
+            if center_lat is None or center_lon is None:
+                st.error("Tidak dapat menentukan titik tengah. Pastikan ada data koordinat.")
+                continue
+
             # Hitung panjang kabel
             cable_length_deg = sum([
                 math.sqrt((l['coords'][-1][0]-l['coords'][0][0])**2 + (l['coords'][-1][1]-l['coords'][0][1])**2)
@@ -574,11 +561,10 @@ if uploaded_files:
             for lbl in road_labels_data:
                 add_road_label(msp, lbl['coords'], lbl['name'], '02_NAMA_JALAN')
 
-            # 3. Kabel
+            # 3. Kabel + label span
             for line in data['lines']:
                 m_coords = [to_m(c[0], c[1]) for c in line['coords']]
                 msp.add_lwpolyline(m_coords, dxfattribs={'layer': '03_KABEL', 'color': 5, 'lineweight': 40})
-                # Tambahkan label span
                 add_span_labels(msp, line, to_m)
 
             # 4. Tiang & Aksesoris
@@ -605,7 +591,6 @@ if uploaded_files:
 
             # ===== LAYOUT (PAPERSPACE) =====
             if include_layout:
-                # Ambil bounding box model
                 model_bbox = get_model_bounding_box(msp)
                 meta = {
                     'project': project_name,
@@ -630,4 +615,5 @@ if uploaded_files:
             )
 
         except Exception as e:
-            st.error(f"Gagal memproses file: {e}")
+            st.error(f"❌ Gagal memproses file: {e}")
+            st.exception(e)   # Tampilkan traceback lengkap untuk debugging
