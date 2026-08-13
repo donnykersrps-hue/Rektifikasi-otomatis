@@ -72,13 +72,15 @@ def get_road_width(highway_type):
     return ROAD_WIDTHS.get(highway_type, 8.0)
 
 # ==========================================
-# 3. BUFFER → DISSOLVE → BOUNDARY
+# 3. CORE ENGINE: BUFFER → DISSOLVE → BOUNDARY
 # ==========================================
 
 def create_road_polygons(roads):
     """
-    Buffer setiap LineString menjadi Polygon, lalu dissolve semua Polygon.
-    Output: list of dict dengan key 'geometry' berisi Polygon/MultiPolygon hasil dissolve.
+    🔥 URUTAN YANG BENAR:
+    1. Buffer setiap LineString → Polygon
+    2. Dissolve semua Polygon → unary_union
+    3. Kembalikan list of Polygon/MultiPolygon hasil dissolve
     """
     if not SHAPELY_AVAILABLE or not roads:
         return []
