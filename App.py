@@ -10,39 +10,30 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 import re
 import os
-import time
+import pandas as pd
 
-# ==========================================
-# 0. PUSTAKA OPSIONAL (Geopandas & Shapely)
-# ==========================================
 try:
-    import geopandas as gpd
-    from shapely.geometry import LineString, Polygon, MultiPolygon, GeometryCollection
+    from shapely.geometry import LineString, Polygon, MultiPolygon
     from shapely.ops import unary_union
     SHAPELY_AVAILABLE = True
 except ImportError:
     SHAPELY_AVAILABLE = False
-    st.warning("⚠️ Pustaka 'geopandas' dan 'shapely' tidak terinstal.")
 
-# ==========================================
-# 1. KONFIGURASI
-# ==========================================
-st.set_page_config(page_title="ASPLAN PRO v14.2 - Ultimate Fixed", layout="wide")
+st.set_page_config(page_title="ASPLAN PRO v15.0 - Final Precision Engine", layout="wide")
 
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
-    "https://overpass.private.coffee/api/interpreter",
-    "https://overpass.kumi.systems/api/interpreter"
+    "https://overpass.private.coffee/api/interpreter"
 ]
 
 ROAD_WIDTHS = {
-    'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
-    'secondary': 12.0, 'tertiary': 10.0, 'residential': 8.0,
-    'service': 5.0, 'unclassified': 7.0, 'track': 4.0, 'path': 2.0
+    'motorway': 16.0, 'trunk': 14.0, 'primary': 12.0,
+    'secondary': 10.0, 'tertiary': 8.0, 'residential': 6.0,
+    'service': 4.0, 'unclassified': 6.0
 }
 
 # ==========================================
-# 2. FUNGSI BANTU & GEOMETRI
+# 1. KONVERSI KOORDINAT PRESISI
 # ==========================================
 def latlon_to_meters(lon, lat, ref_lon, ref_lat):
     r = 6378137.0
@@ -51,7 +42,7 @@ def latlon_to_meters(lon, lat, ref_lon, ref_lat):
     return x, y
 
 def smart_rename(name):
-    if not name: return name
+    if not name or pd.isna(name): return ""
     upper = str(name).upper().strip()
     if re.search(r'\bSLACK\b|\.SS\b|SS\b|HANGER', upper): return "New Slack Support"
     if re.search(r'\bCL(?:OS)?', upper) or re.search(r'\bC\d+', upper):
@@ -62,58 +53,14 @@ def smart_rename(name):
         return "New Closure"
     return name
 
-def get_road_width(highway_type):
-    if isinstance(highway_type, list): highway_type = highway_type[0] if highway_type else 'unclassified'
-    return ROAD_WIDTHS.get(highway_type, 8.0)
-
-def extract_polygons(geom):
-    """Fungsi Anti-Gagal untuk mengekstrak Polygon dari hasil Shapely apa pun bentuknya"""
-    polys = []
-    if not geom or geom.is_empty: return polys
+# ==========================================
+# 2. FETCH DATA JALAN ONLINE (DIRECT OVERPASS)
+# ==========================================
+def fetch_osm_roads(min_lon, min_lat, max_lon, max_lat):
+    buf = 0.008
+    south, north = min_lat - buf, max_lat + buf
+    west, east = min_lon - buf, max_lon + buf
     
-    if geom.geom_type == 'Polygon':
-        polys.append(geom)
-    elif geom.geom_type == 'MultiPolygon':
-        polys.extend(list(geom.geoms))
-    elif geom.geom_type == 'GeometryCollection':
-        for g in geom.geoms:
-            if g.geom_type == 'Polygon': polys.append(g)
-            elif g.geom_type == 'MultiPolygon': polys.extend(list(g.geoms))
-    return polys
-
-# ==========================================
-# 3. CORE ENGINE: BUFFER → DISSOLVE
-# ==========================================
-def create_road_polygons(roads):
-    if not SHAPELY_AVAILABLE or not roads: return []
-    polygons = []
-    for road in roads:
-        coords = road['coords']
-        if len(coords) < 2: continue
-        try:
-            line = LineString(coords)
-            width = road.get('width', 8.0)
-            poly = line.buffer(width / 2.0, cap_style=2, join_style=2)
-            if not poly.is_empty and poly.is_valid:
-                polygons.append(poly)
-        except Exception:
-            continue
-
-    if not polygons: return []
-    try:
-        dissolved = unary_union(polygons)
-        extracted = extract_polygons(dissolved)
-        return [{'geometry': p, 'name': ''} for p in extracted]
-    except Exception:
-        return []
-
-# ==========================================
-# 4. ENGINE PETA (REQUESTS ANTI-BLOCK)
-# ==========================================
-def fetch_roads_online(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
-    buffer = 0.008
-    north, south = max_lat + buffer, min_lat - buffer
-    east, west = max_lon + buffer, min_lon - buffer
     query = f"""
     [out:json][timeout:25];
     (
@@ -121,35 +68,29 @@ def fetch_roads_online(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
     );
     out geom;
     """
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'Accept': 'application/json'
-    }
-
-    for endpoint in OVERPASS_ENDPOINTS:
+    for ep in OVERPASS_ENDPOINTS:
         try:
-            res = requests.post(endpoint, data={'data': query}, headers=headers, timeout=30)
+            res = requests.post(ep, data={'data': query}, headers=headers, timeout=20)
             if res.status_code == 200:
                 data = res.json()
-                roads = []
-                for element in data.get('elements', []):
-                    if element.get('type') != 'way': continue
-                    highway = element.get('tags', {}).get('highway', '')
-                    if not highway: continue
-                    geom = element.get('geometry', [])
-                    if len(geom) < 2: continue
-                    
-                    m_coords = [latlon_to_meters(pt['lon'], pt['lat'], ref_lon, ref_lat) for pt in geom]
-                    roads.append({'coords': m_coords, 'highway': highway, 'width': get_road_width(highway)})
-                if roads: return roads
+                ways = []
+                for elem in data.get('elements', []):
+                    if elem.get('type') == 'way' and 'geometry' in elem:
+                        geom = elem['geometry']
+                        if len(geom) >= 2:
+                            coords = [(pt['lon'], pt['lat']) for pt in geom]
+                            h_type = elem.get('tags', {}).get('highway', 'residential')
+                            r_name = elem.get('tags', {}).get('name', '')
+                            ways.append({'coords': coords, 'highway': h_type, 'name': r_name})
+                if ways: return ways
         except Exception:
-            time.sleep(1) # Jeda agar tidak spam server
             continue
     return []
 
 # ==========================================
-# 5. PARSER KMZ
+# 3. PARSER KMZ (ACUAN REF UNIFIED)
 # ==========================================
 def parse_kmz(kmz_bytes):
     with zipfile.ZipFile(io.BytesIO(kmz_bytes)) as z:
@@ -158,126 +99,139 @@ def parse_kmz(kmz_bytes):
         root = ET.fromstring(z.read(kml_files[0]))
 
     ns = {'kml': 'http://www.opengis.net/kml/2.2'}
-    cables, poles, all_raw_coords = [], [], []
+    cables, poles, all_lons, all_lats = [], [], [], []
 
-    for placemark in root.findall('.//kml:Placemark', ns):
-        line = placemark.find('.//kml:LineString/kml:coordinates', ns)
+    for pm in root.findall('.//kml:Placemark', ns):
+        # LineString
+        line = pm.find('.//kml:LineString/kml:coordinates', ns)
         if line is not None and line.text:
             pts = []
             for pt in line.text.strip().split():
-                parts = pt.split(',')
-                if len(parts) >= 2:
-                    lon, lat = float(parts[0]), float(parts[1])
+                p = pt.split(',')
+                if len(p) >= 2:
+                    lon, lat = float(p[0]), float(p[1])
                     pts.append((lon, lat))
-                    all_raw_coords.append((lon, lat))
-            if pts: cables.append({'name': placemark.findtext('kml:name', '', ns), 'coords': pts})
+                    all_lons.append(lon); all_lats.append(lat)
+            if pts: cables.append({'name': pm.findtext('kml:name', '', ns), 'coords': pts})
 
-        point = placemark.find('.//kml:Point/kml:coordinates', ns)
+        # Point
+        point = pm.find('.//kml:Point/kml:coordinates', ns)
         if point is not None and point.text:
-            parts = point.text.strip().split(',')
-            if len(parts) >= 2:
-                lon, lat = float(parts[0]), float(parts[1])
-                name = placemark.findtext('kml:name', 'Pole', ns)
-                desc = placemark.findtext('kml:description', '', ns).lower()
-                has_acc = any(k in desc for k in ['acc', 'accessories', 'slack', 'box', 'closure', 'odp'])
-                all_raw_coords.append((lon, lat))
-                poles.append({'name': name, 'raw_coords': (lon, lat), 'has_accessories': has_acc})
+            p = point.text.strip().split(',')
+            if len(p) >= 2:
+                lon, lat = float(p[0]), float(p[1])
+                name = pm.findtext('kml:name', 'Pole', ns)
+                all_lons.append(lon); all_lats.append(lat)
+                poles.append({'name': name, 'lon': lon, 'lat': lat})
 
-    if not all_raw_coords: return None
+    if not all_lons: return None
 
-    lons, lats = [p[0] for p in all_raw_coords], [p[1] for p in all_raw_coords]
-    min_lon, max_lon = min(lons), max(lons)
-    min_lat, max_lat = min(lats), max(lats)
-    ref_lon, ref_lat = sum(lons) / len(lons), sum(lats) / len(lats)
+    # TITIACUAN GLOBAL TUNGGAL (Mencegah Tiang/Kabel Geser)
+    ref_lon = sum(all_lons) / len(all_lons)
+    ref_lat = sum(all_lats) / len(all_lats)
 
-    converted_cables = [{'name': c['name'], 'coords': [latlon_to_meters(lon, lat, ref_lon, ref_lat) for lon, lat in c['coords']]} for c in cables]
+    # Konversi Kabel & Tiang ke Meter
+    cables_m = [{'name': c['name'], 'coords': [latlon_to_meters(lon, lat, ref_lon, ref_lat) for lon, lat in c['coords']]} for c in cables]
+    poles_m = [{'name': p['name'], 'coords': latlon_to_meters(p['lon'], p['lat'], ref_lon, ref_lat), 'raw': (p['lon'], p['lat'])} for p in poles]
 
-    converted_poles = []
-    coord_tracker, inspector_logs = {}, []
-    for p in poles:
-        mx, my = latlon_to_meters(p['raw_coords'][0], p['raw_coords'][1], ref_lon, ref_lat)
-        coord_key = (round(mx, 2), round(my, 2))
-        is_overlap = False
-        if coord_key in coord_tracker:
-            inspector_logs.append({'level': 'WARNING', 'category': 'Overlap', 'detail': f"Tiang '{p['name']}' bertumpuk dengan '{coord_tracker[coord_key]}'"})
-            is_overlap = True
-        else: coord_tracker[coord_key] = p['name']
-        converted_poles.append({'name': p['name'], 'coords': (mx, my), 'has_accessories': p['has_accessories'], 'is_overlap': is_overlap, 'raw_latlon': p['raw_coords']})
-
-    # Hybrid Processing
+    # Process Roads (Meter -> Buffer -> Dissolve)
+    raw_roads = fetch_osm_roads(min(all_lons), min(all_lats), max(all_lons), max(all_lats))
     road_polygons = []
-    road_source = 'OVERPASS_ONLINE'
-    
-    roads = fetch_roads_online(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat)
-    if roads:
-        road_polygons = create_road_polygons(roads)
-    
-    # Fallback jika online gagal
-    if not road_polygons and converted_cables:
-        polygons = [LineString(c['coords']).buffer(8.0, cap_style=2, join_style=2) for c in converted_cables if len(c['coords']) >= 2]
-        if polygons:
-            dissolved = unary_union(polygons)
-            road_polygons = [{'geometry': p, 'name': ''} for p in extract_polygons(dissolved)]
-            road_source = 'FALLBACK_CORRIDOR'
+    road_labels = []
+
+    if SHAPELY_AVAILABLE and raw_roads:
+        buffered_list = []
+        for r in raw_roads:
+            m_coords = [latlon_to_meters(lon, lat, ref_lon, ref_lat) for lon, lat in r['coords']]
+            if len(m_coords) >= 2:
+                ls = LineString(m_coords)
+                w = ROAD_WIDTHS.get(r['highway'], 6.0)
+                # BUFFER DALAM METER
+                poly = ls.buffer(w / 2.0, cap_style=2, join_style=2)
+                if not poly.is_empty and poly.is_valid:
+                    buffered_list.append(poly)
+                
+                # Simpan Label Nama Jalan
+                if r['name'] and ls.length > 30:
+                    road_labels.append({'name': r['name'], 'line': ls})
+
+        if buffered_list:
+            # DISSOLVE POLYGON UTUH
+            merged = unary_union(buffered_list)
+            if merged.geom_type == 'Polygon':
+                road_polygons = [merged]
+            elif merged.geom_type == 'MultiPolygon':
+                road_polygons = list(merged.geoms)
 
     return {
-        'cables': converted_cables, 'poles': converted_poles,
-        'road_polygons': road_polygons, 'road_source': road_source,
-        'inspector': inspector_logs
+        'cables': cables_m, 'poles': poles_m,
+        'road_polygons': road_polygons, 'road_labels': road_labels
     }
 
 # ==========================================
-# 6. DXF GENERATOR
+# 4. GENERATOR DXF (METER & BOUNDARY ONLY)
 # ==========================================
-def build_dxf_document(data, proj_info):
+def build_dxf(data):
     doc = ezdxf.new(dxfversion='AC1027')
     doc.header['$INSUNITS'] = units.M
 
-    layers = doc.layers
-    layers.add("01_BADAN_JALAN", color=8, lineweight=13)
-    layers.add("03_KABEL_FO", color=5, lineweight=40)
-    layers.add("04_POLE_TIANG", color=3, lineweight=30)
-    layers.add("05_SMARTBOX_SLACK", color=1, lineweight=25)
+    doc.layers.add("01_BADAN_JALAN", color=8, lineweight=13)
+    doc.layers.add("01_NAMA_JALAN", color=7, lineweight=18)
+    doc.layers.add("03_KABEL_FO", color=5, lineweight=40)
+    doc.layers.add("04_POLE_TIANG", color=3, lineweight=30)
+    doc.layers.add("05_SMARTBOX", color=1, lineweight=25)
 
     msp = doc.modelspace()
 
-    # 1. JALAN
-    for road in data.get('road_polygons', []):
-        geom = road.get('geometry')
-        if geom and geom.exterior:
-            coords_2d = [(float(pt[0]), float(pt[1])) for pt in geom.exterior.coords]
-            if len(coords_2d) >= 3:
-                msp.add_lwpolyline(coords_2d, close=True, dxfattribs={'layer': '01_BADAN_JALAN', 'color': 8})
+    # 1. BADAN JALAN (Garis Luar / Exterior Boundary Polygon Saja)
+    for poly in data['road_polygons']:
+        if poly.exterior:
+            coords = list(poly.exterior.coords)
+            msp.add_lwpolyline(coords, close=True, dxfattribs={'layer': '01_BADAN_JALAN', 'color': 8})
 
-    # 2. KABEL
-    for cable in data['cables']:
-        pts = [(float(p[0]), float(p[1])) for p in cable['coords']]
-        if len(pts) >= 2: msp.add_lwpolyline(pts, dxfattribs={'layer': '03_KABEL_FO', 'color': 5, 'lineweight': 40})
+    # 2. NAMA JALAN
+    for lbl in data['road_labels']:
+        line = lbl['line']
+        mid_pt = line.interpolate(0.5, normalized=True)
+        p1, p2 = line.coords[0], line.coords[-1]
+        angle = math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
+        if angle > 90: angle -= 180
+        elif angle < -90: angle += 180
+        
+        msp.add_text(
+            lbl['name'],
+            dxfattribs={'layer': '01_NAMA_JALAN', 'height': 2.0, 'color': 7, 'rotation': angle}
+        ).set_placement((mid_pt.x, mid_pt.y))
 
-    # 3. TIANG & SMARTBOX
+    # 3. KABEL
+    for c in data['cables']:
+        if len(c['coords']) >= 2:
+            msp.add_lwpolyline(c['coords'], dxfattribs={'layer': '03_KABEL_FO', 'color': 5, 'lineweight': 40})
+
+    # 4. TIANG & SMARTBOX
     pt_a = data['poles'][0]['name'] if data['poles'] else ""
     pt_b = data['poles'][-1]['name'] if data['poles'] else ""
 
     for p in data['poles']:
-        pos = (float(p['coords'][0]), float(p['coords'][1]))
+        pos = p['coords']
         name = p['name']
         acc_name = smart_rename(name)
         has_acc = (acc_name != name) and (acc_name != "")
 
         msp.add_circle(pos, radius=1.2, dxfattribs={'layer': '04_POLE_TIANG', 'color': 3})
 
-        if (name in [pt_a, pt_b]) or has_acc or p['has_accessories']:
+        if (name in [pt_a, pt_b]) or has_acc:
             disp = [acc_name] if has_acc else []
-            box_lines = [f"POLE: {name}"] + [f"+ {n}" for n in disp] + [f"Lat: {p['raw_latlon'][1]:.6f}", f"Lon: {p['raw_latlon'][0]:.6f}"]
+            box_lines = [f"POLE: {name}"] + [f"+ {n}" for n in disp] + [f"Lat: {p['raw'][1]:.6f}", f"Lon: {p['raw'][0]:.6f}"]
             tx, ty = pos[0] + 8.0, pos[1] + 8.0
             
-            msp.add_line(pos, (tx, ty), dxfattribs={'layer': '05_SMARTBOX_SLACK', 'color': 1})
-            mtext = msp.add_mtext("\n".join(box_lines), dxfattribs={'layer': '05_SMARTBOX_SLACK', 'char_height': 1.5, 'color': 1})
+            msp.add_line(pos, (tx, ty), dxfattribs={'layer': '05_SMARTBOX', 'color': 1})
+            mtext = msp.add_mtext("\n".join(box_lines), dxfattribs={'layer': '05_SMARTBOX', 'char_height': 1.5, 'color': 1})
             mtext.set_location((tx, ty), attachment_point=7)
             
             bw = max(len(l) for l in box_lines) * 1.5 * 0.65
             bh = len(box_lines) * 1.5 * 1.6
-            msp.add_lwpolyline([(tx-1, ty+1), (tx+bw+2, ty+1), (tx+bw+2, ty-bh-1), (tx-1, ty-bh-1)], close=True, dxfattribs={'layer': '05_SMARTBOX_SLACK', 'color': 1})
+            msp.add_lwpolyline([(tx-1, ty+1), (tx+bw+2, ty+1), (tx+bw+2, ty-bh-1), (tx-1, ty-bh-1)], close=True, dxfattribs={'layer': '05_SMARTBOX', 'color': 1})
         else:
             msp.add_text(name, dxfattribs={'layer': '04_POLE_TIANG', 'height': 1.8, 'color': 7}).set_placement((pos[0] + 2.0, pos[1] + 2.0))
 
@@ -286,24 +240,20 @@ def build_dxf_document(data, proj_info):
     return out_bytes.getvalue()
 
 # ==========================================
-# 7. STREAMLIT UI
+# 5. STREAMLIT INTERFACE
 # ==========================================
-st.sidebar.title("📇 Informasi Proyek")
-span_name = st.sidebar.text_input("SPAN NAME", "14PBG007_REMBANGPBLG")
-project_code = st.sidebar.text_input("PROJECT CODE", "RM-26-000327")
-
-st.title("⚡ ASPLAN PRO v14.3 - The Ultimate Fixed Engine")
+st.title("⚡ ASPLAN PRO v15.0 - Final Precision Engine")
 
 uploaded_file = st.file_uploader("📂 Upload File KMZ", type=['kmz'])
 
 if uploaded_file:
-    with st.spinner("🔄 Menarik Peta Jalan dan Memproses DXF..."):
+    with st.spinner("🔄 Memproses Peta Jalan & DXF..."):
         parsed = parse_kmz(uploaded_file.read())
 
     if not parsed:
-        st.error("❌ Gagal memproses file KMZ.")
+        st.error("❌ File KMZ tidak valid atau kosong.")
     else:
-        st.success(f"✅ Selesai! Peta ditarik via: **{parsed['road_source']}**")
+        st.success(f"✅ Berhasil! Ditemukan {len(parsed['road_polygons'])} koridor jalan ter-dissolve.")
 
         col1, col2 = st.columns([1.2, 1])
 
@@ -312,26 +262,21 @@ if uploaded_file:
             fig, ax = plt.subplots(figsize=(7, 6), facecolor='#0e1117')
             ax.set_facecolor('#0e1117')
 
-            # Render Peta Jalan dengan Z-Order paksa di latar belakang
-            for r in parsed['road_polygons']:
-                geom = r.get('geometry')
-                if geom:
-                    polys = extract_polygons(geom)
-                    for poly in polys:
-                        xs, ys = poly.exterior.xy
-                        # Gunakan linewidth tebal & zorder agar menonjol di skala besar
-                        ax.fill(xs, ys, color='#555555', alpha=0.9, zorder=1)
-                        ax.plot(xs, ys, color='#ffffff', linewidth=2.0, alpha=1.0, zorder=2)
+            # Render Poligon Jalan Utuh
+            for poly in parsed['road_polygons']:
+                xs, ys = poly.exterior.xy
+                ax.fill(xs, ys, color='#444444', alpha=0.8, zorder=1)
+                ax.plot(xs, ys, color='#ffffff', linewidth=1.2, zorder=2)
 
             # Render Kabel
             for c in parsed['cables']:
                 xs, ys = [p[0] for p in c['coords']], [p[1] for p in c['coords']]
-                ax.plot(xs, ys, color='#00a8ff', linewidth=2.5, zorder=3)
+                ax.plot(xs, ys, color='#00a8ff', linewidth=2.0, zorder=3)
 
             # Render Tiang
             if parsed['poles']:
                 pxs, pys = [p['coords'][0] for p in parsed['poles']], [p['coords'][1] for p in parsed['poles']]
-                ax.scatter(pxs, pys, color='#ff4757', s=25, zorder=4)
+                ax.scatter(pxs, pys, color='#00ff7f', s=20, zorder=4)
 
             ax.set_aspect('equal', adjustable='datalim')
             ax.tick_params(colors='white', labelsize=8)
@@ -339,18 +284,17 @@ if uploaded_file:
             st.pyplot(fig)
 
         with col2:
-            st.markdown("### 📊 Ringkasan Data")
-            st.write(f"- 🟢 Titik Tiang: **{len(parsed['poles'])}**")
-            st.write(f"- 🔵 Segmen Kabel: **{len(parsed['cables'])}**")
-            st.write(f"- 🛣️ Poligon Jalan: **{len(parsed['road_polygons'])}**")
-            
-            proj_info = {'span_name': span_name, 'project_code': project_code}
-            dxf_string = build_dxf_document(parsed, proj_info)
+            st.markdown("### 📊 Ringkasan Format DXF")
+            st.write(f"- Koridor Jalan (Dissolved): **{len(parsed['road_polygons'])}**")
+            st.write(f"- Label Nama Jalan: **{len(parsed['road_labels'])}**")
+            st.write(f"- Total Tiang: **{len(parsed['poles'])}**")
+            st.write(f"- Total Kabel: **{len(parsed['cables'])}**")
 
+            dxf_data = build_dxf(parsed)
             st.download_button(
-                label=f"💾 Download File DXF",
-                data=dxf_string,
-                file_name=f"{uploaded_file.name.replace('.kmz', '')}_{datetime.now().strftime('%Y%m%d')}.dxf",
+                label="💾 Download File DXF (As-Built Presisi)",
+                data=dxf_data,
+                file_name=f"{uploaded_file.name.replace('.kmz', '')}_ASPLAN_V15.dxf",
                 mime="application/dxf",
                 type="primary",
                 use_container_width=True
