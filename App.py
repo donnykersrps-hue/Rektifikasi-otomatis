@@ -15,9 +15,8 @@ import ssl
 # ==========================================
 # CONFIGURATION
 # ==========================================
-st.set_page_config(page_title="ASPLAN PRO v13.1 - Robust GIS to DXF", layout="wide")
+st.set_page_config(page_title="ASPLAN PRO v14.0 - Dissolved Roads & Smart Labels", layout="wide")
 
-# Server Mirror Overpass API (Mencegah Timeout tunggal)
 OVERPASS_SERVERS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
@@ -38,7 +37,7 @@ ROAD_WIDTHS = {
 }
 
 # ==========================================
-# 1. HELPER FUNCTIONS
+# 1. HELPER & DISSOLVE VECTOR FUNCTIONS
 # ==========================================
 
 def latlon_to_meters(lon, lat, ref_lon, ref_lat):
@@ -67,6 +66,57 @@ def get_road_width(highway_type):
     if isinstance(highway_type, list):
         highway_type = highway_type[0] if highway_type else 'unclassified'
     return ROAD_WIDTHS.get(highway_type, 8.0)
+
+def dissolve_road_segments(roads):
+    """
+    LOGIKA DISSOLVE: Menggabungkan segmen-segmen jalan terpisah 
+    menjadi garis/poligon menyatu yang mulus tanpa patahan.
+    """
+    if not roads:
+        return []
+
+    grouped = {}
+    for r in roads:
+        key = (r['name'], r['highway'], r['width'])
+        if key not in grouped:
+            grouped[key] = []
+        grouped[key].append(r['coords'])
+
+    dissolved_roads = []
+
+    for (name, highway, width), lines in grouped.items():
+        # Gabungkan segmen terhubung (Node Matching)
+        merged_lines = []
+        for line in lines:
+            if not merged_lines:
+                merged_lines.append(list(line))
+                continue
+            
+            merged = False
+            for m in merged_lines:
+                # Sambung jika titik akhir bersentuhan dengan titik awal
+                if math.hypot(m[-1][0]-line[0][0], m[-1][1]-line[0][1]) < 1.0:
+                    m.extend(line[1:])
+                    merged = True
+                    break
+                elif math.hypot(m[0][0]-line[-1][0], m[0][1]-line[-1][1]) < 1.0:
+                    m[:0] = line[:-1]
+                    merged = True
+                    break
+            if not merged:
+                merged_lines.append(list(line))
+
+        for line in merged_lines:
+            poly = buffer_road_line(line, width)
+            dissolved_roads.append({
+                'name': name,
+                'coords': poly if poly else line,
+                'centerline': line,
+                'is_polygon': poly is not None,
+                'width': width
+            })
+
+    return dissolved_roads
 
 def buffer_road_line(coords, width):
     """Buffer garis jalan menjadi poligon manual"""
@@ -121,13 +171,12 @@ def fetch_roads_quickosm(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    # Coba beberapa endpoint server jika ada yang busy/timeout
     for endpoint in OVERPASS_SERVERS:
         try:
             req = urllib.request.Request(
                 endpoint,
                 data=query.encode('utf-8'),
-                headers={'User-Agent': 'ASPLAN-PRO-QuickOSM/13.1'}
+                headers={'User-Agent': 'ASPLAN-PRO-QuickOSM/14.0'}
             )
 
             with urllib.request.urlopen(req, timeout=12, context=ctx) as response:
@@ -161,7 +210,6 @@ def fetch_roads_quickosm(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
         except Exception:
             continue
 
-    st.warning("⚠️ Koneksi server Overpass GIS lambat. Mengaktifkan Mode Smart Road Corridor Fallback.")
     return []
 
 # ==========================================
@@ -240,26 +288,27 @@ def parse_kmz(kmz_bytes):
             'is_overlap': is_overlap
         })
 
-    # PROSES ROAD GEOMETRY
-    roads = fetch_roads_quickosm(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat)
-    road_polygons = []
+    # PROSES DISSOLVE GEOMETRI JALAN
+    raw_roads = fetch_roads_quickosm(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat)
+    dissolved_roads = dissolve_road_segments(raw_roads)
 
-    for road in roads:
-        poly = buffer_road_line(road['coords'], road['width'])
-        if poly:
-            road_polygons.append({'name': road['name'], 'coords': poly, 'is_polygon': True})
-
-    # SMART FALLBACK: Jika GIS Server down/timeout, buat Polygon Koridor Jalan 15M Otomatis
-    if not road_polygons and converted_cables:
+    # SMART FALLBACK: Jika GIS Server down/timeout, buat Polygon Koridor 16m
+    if not dissolved_roads and converted_cables:
         for cable in converted_cables:
             corridor_poly = buffer_road_line(cable['coords'], width=16.0)
             if corridor_poly:
-                road_polygons.append({'name': 'JALAN UTAMA ROUTE', 'coords': corridor_poly, 'is_polygon': True})
+                dissolved_roads.append({
+                    'name': 'JALAN UTAMA ROUTE',
+                    'coords': corridor_poly,
+                    'centerline': cable['coords'],
+                    'is_polygon': True,
+                    'width': 16.0
+                })
 
     return {
         'cables': converted_cables,
         'poles': converted_poles,
-        'roads': road_polygons,
+        'roads': dissolved_roads,
         'inspector': inspector_logs,
         'ref': (ref_lon, ref_lat),
         'bbox': (min_lon, min_lat, max_lon, max_lat)
@@ -285,6 +334,7 @@ def build_dxf_document(data, proj_info):
     msp = doc.modelspace()
     all_x, all_y = [], []
 
+    # 1. RENDER JALAN DISSOLVED & ROTASI NAMA JALAN
     for road in data.get('roads', []):
         pts = road['coords']
         if len(pts) < 2:
@@ -292,10 +342,29 @@ def build_dxf_document(data, proj_info):
 
         msp.add_lwpolyline(pts, close=road.get('is_polygon', False), dxfattribs={'layer': '01_BADAN_JALAN', 'color': 8})
 
-        if road.get('name'):
-            mid_pt = pts[len(pts) // 2]
-            msp.add_text(road['name'].upper(), dxfattribs={'layer': '01_NAMA_JALAN', 'height': 2.5, 'color': 2}).set_placement((mid_pt[0], mid_pt[1] + 1.5))
+        # Penempatan Teks Nama Jalan yang Mengikuti Sudut Kemiringan Jalan
+        if road.get('name') and 'centerline' in road and len(road['centerline']) >= 2:
+            cline = road['centerline']
+            mid_idx = len(cline) // 2
+            p1, p2 = cline[mid_idx-1], cline[mid_idx]
 
+            # Hitung sudut rotasi jalan (Rotasi Teks CAD)
+            dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+            angle_deg = math.degrees(math.atan2(dy, dx))
+            if angle_deg > 90 or angle_deg < -90:
+                angle_deg += 180  # Mencegah teks terbalik
+
+            txt_pt = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+
+            text_entity = msp.add_text(road['name'].upper(), dxfattribs={
+                'layer': '01_NAMA_JALAN',
+                'height': 2.8,
+                'color': 2,
+                'rotation': angle_deg
+            })
+            text_entity.set_placement(txt_pt)
+
+    # 2. RENDER KABEL
     for cable in data['cables']:
         pts = cable['coords']
         if len(pts) < 2:
@@ -304,6 +373,7 @@ def build_dxf_document(data, proj_info):
             all_x.append(pt[0]); all_y.append(pt[1])
         msp.add_lwpolyline(pts, dxfattribs={'layer': '03_KABEL_FO', 'color': 1, 'lineweight': 50})
 
+    # 3. RENDER TIANG & AKSESORIS
     for p in data['poles']:
         pos, name = p['coords'], p['name']
         all_x.append(pos[0]); all_y.append(pos[1])
@@ -323,6 +393,7 @@ def build_dxf_document(data, proj_info):
         text_y_offset = 0.8 if not p['is_overlap'] else 1.8
         msp.add_text(display_name, dxfattribs={'layer': '04_POLE_TIANG', 'height': 0.9, 'color': 3}).set_placement((pos[0] + 1.8, pos[1] + text_y_offset))
 
+    # 4. LAYOUT A3 PAPER SPACE
     layout = doc.layouts.get("Paper_A3") if "Paper_A3" in doc.layouts else doc.layouts.new("Paper_A3")
     layout.dxf.paper_width = 420.0
     layout.dxf.paper_height = 297.0
@@ -389,18 +460,18 @@ checked_by = st.sidebar.text_input("CHECKED BY", "IFORTE")
 approved_by = st.sidebar.text_input("APPROVED BY", "IFORTE")
 revision = st.sidebar.text_input("REVISION", "0")
 
-st.title("⚡ ASPLAN PRO v13.1 - Robust GIS to DXF Converter")
+st.title("⚡ ASPLAN PRO v14.0 - Dissolved Roads & Smart Labels")
 
 uploaded_file = st.file_uploader("📂 Upload File KMZ", type=['kmz'])
 
 if uploaded_file:
-    with st.spinner("🔄 Memproses data & menarik peta jalan..."):
+    with st.spinner("🔄 Memproses data & melakukan Dissolve Geometri Jalan..."):
         parsed = parse_kmz(uploaded_file.read())
 
     if not parsed:
         st.error("❌ Gagal memproses file KMZ. Pastikan file valid.")
     else:
-        st.success("✅ Data berhasil diproses!")
+        st.success("✅ Data & Dissolve Geometri Jalan Berhasil Diproses!")
         col1, col2 = st.columns([1, 1])
 
         with col1:
@@ -409,13 +480,13 @@ if uploaded_file:
             ax.set_facecolor('#0e1117')
             fig.patch.set_facecolor('#0e1117')
 
-            # Render Peta Jalan (Highlight Abu-abu Tebal)
+            # Render Peta Jalan Mulus Hasil Dissolve (Abu-abu Kontras)
             for r in parsed['roads']:
                 xs = [p[0] for p in r['coords']]
                 ys = [p[1] for p in r['coords']]
                 if r.get('is_polygon', False):
                     ax.fill(xs, ys, color='#555555', alpha=0.6, label='Badan Jalan')
-                ax.plot(xs, ys, color='#aaaaaa', linewidth=1.5, alpha=0.9)
+                ax.plot(xs, ys, color='#aaaaaa', linewidth=1.2, alpha=0.9)
 
             # Render Kabel
             for c in parsed['cables']:
@@ -445,7 +516,7 @@ if uploaded_file:
             st.markdown("**📊 Statistik:**")
             st.write(f"- Segmen Kabel: {len(parsed['cables'])}")
             st.write(f"- Titik Tiang: {len(parsed['poles'])}")
-            st.write(f"- Jalur Jalan: {len(parsed['roads'])}")
+            st.write(f"- Jalur Jalan (Dissolved): {len(parsed['roads'])}")
 
         proj_info = {
             'span_name': span_name,
