@@ -13,7 +13,7 @@ import re
 import os
 
 # ==========================================
-# 0. PUSTAKA OPSIONAL (untuk GeoJSON & Buffer)
+# 0. PUSTAKA OPSIONAL (Geopandas & Shapely)
 # ==========================================
 try:
     import geopandas as gpd
@@ -29,7 +29,7 @@ except ImportError:
 # ==========================================
 # 1. KONFIGURASI
 # ==========================================
-st.set_page_config(page_title="ASPLAN PRO v14.1 - Dissolve Otomatis", layout="wide")
+st.set_page_config(page_title="ASPLAN PRO v14.2 - Buffer→Dissolve→Boundary", layout="wide")
 
 OVERPASS_ENDPOINTS = [
     "https://overpass.private.coffee/api/interpreter",
@@ -72,27 +72,48 @@ def get_road_width(highway_type):
     return ROAD_WIDTHS.get(highway_type, 8.0)
 
 # ==========================================
-# 3. DISSOLVE OTOMATIS
+# 3. BUFFER → DISSOLVE → BOUNDARY
 # ==========================================
 
-def dissolve_road_polygons(polygons):
-    """Gabungkan semua poligon jalan yang bersentuhan menjadi satu kesatuan"""
-    if not SHAPELY_AVAILABLE or not polygons:
-        return polygons
-    geoms = [p['geometry'] for p in polygons if p.get('geometry') is not None]
-    if not geoms:
-        return polygons
+def create_road_polygons(roads):
+    """
+    Buffer setiap LineString menjadi Polygon, lalu dissolve semua Polygon.
+    Output: list of dict dengan key 'geometry' berisi Polygon/MultiPolygon hasil dissolve.
+    """
+    if not SHAPELY_AVAILABLE or not roads:
+        return []
+
+    polygons = []
+    for road in roads:
+        coords = road['coords']
+        if len(coords) < 2:
+            continue
+        line = LineString(coords)
+        width = road.get('width', 8.0)
+        buffer_width = width / 2.0
+        try:
+            poly = line.buffer(buffer_width, cap_style=2, join_style=2)
+            if not poly.is_empty:
+                polygons.append(poly)
+        except Exception:
+            continue
+
+    if not polygons:
+        return []
+
+    # Dissolve semua polygon
     try:
-        dissolved = unary_union(geoms)
+        dissolved = unary_union(polygons)
         if dissolved.is_empty:
-            return polygons
-        if dissolved.geom_type == 'MultiPolygon':
-            result = [{'geometry': g, 'name': ''} for g in dissolved.geoms]
+            return []
+        if dissolved.geom_type == 'Polygon':
+            return [{'geometry': dissolved, 'name': ''}]
+        elif dissolved.geom_type == 'MultiPolygon':
+            return [{'geometry': g, 'name': ''} for g in dissolved.geoms]
         else:
-            result = [{'geometry': dissolved, 'name': ''}]
-        return result
+            return []
     except Exception:
-        return polygons
+        return []
 
 # ==========================================
 # 4. ENGINE DATA JALAN (OFFLINE-FIRST)
@@ -154,7 +175,7 @@ def fetch_roads_online(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
             req = urllib.request.Request(
                 endpoint,
                 data=query.encode('utf-8'),
-                headers={'User-Agent': 'ASPLAN-PRO-Offline/14.1'}
+                headers={'User-Agent': 'ASPLAN-PRO/14.2'}
             )
             with urllib.request.urlopen(req, timeout=15) as response:
                 data = json.loads(response.read().decode('utf-8'))
@@ -184,32 +205,6 @@ def fetch_roads_online(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
         except Exception:
             continue
     return []
-
-def create_road_polygons(roads):
-    if not SHAPELY_AVAILABLE or not roads:
-        return []
-    polygons = []
-    for road in roads:
-        coords = road['coords']
-        if len(coords) < 2:
-            continue
-        line = LineString(coords)
-        width = road.get('width', 8.0)
-        buffer_width = width / 2.0
-        try:
-            poly = line.buffer(buffer_width, cap_style=2, join_style=2)
-            if not poly.is_empty:
-                polygons.append({
-                    'name': road.get('name', ''),
-                    'geometry': poly,
-                    'is_polygon': True
-                })
-        except Exception:
-            continue
-    # === DISSOLVE OTOMATIS ===
-    if polygons:
-        polygons = dissolve_road_polygons(polygons)
-    return polygons
 
 # ==========================================
 # 5. PARSER KMZ
@@ -269,11 +264,13 @@ def parse_kmz(kmz_bytes, geojson_path=None):
     ref_lon = sum(lons) / len(lons)
     ref_lat = sum(lats) / len(lats)
 
+    # Konversi kabel
     converted_cables = []
     for c in cables:
         m_pts = [latlon_to_meters(lon, lat, ref_lon, ref_lat) for lon, lat in c['coords']]
         converted_cables.append({'name': c['name'], 'coords': m_pts})
 
+    # Konversi tiang & deteksi overlap
     converted_poles = []
     coord_tracker = {}
     inspector_logs = []
@@ -299,6 +296,7 @@ def parse_kmz(kmz_bytes, geojson_path=None):
             'is_overlap': is_overlap
         })
 
+    # Deteksi ujung kabel putus
     if converted_cables and converted_poles:
         pole_positions = [p['coords'] for p in converted_poles]
         for cable in converted_cables:
@@ -323,6 +321,7 @@ def parse_kmz(kmz_bytes, geojson_path=None):
     road_polygons = []
     road_source = 'NONE'
 
+    # PRIORITAS 1: GeoJSON Offline
     if geojson_path and os.path.exists(geojson_path) and SHAPELY_AVAILABLE:
         roads = load_roads_from_geojson(geojson_path, ref_lon, ref_lat)
         if roads:
@@ -332,6 +331,7 @@ def parse_kmz(kmz_bytes, geojson_path=None):
         else:
             st.warning("⚠️ GeoJSON ditemukan tetapi tidak ada data jalan yang valid.")
 
+    # PRIORITAS 2: Overpass Online
     if not road_polygons:
         roads = fetch_roads_online(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat)
         if roads:
@@ -341,24 +341,30 @@ def parse_kmz(kmz_bytes, geojson_path=None):
         else:
             st.warning("⚠️ Gagal mengambil data dari Overpass, menggunakan fallback koridor.")
 
+    # PRIORITAS 3: Fallback koridor dari kabel
     if not road_polygons and converted_cables:
+        polygons = []
         for cable in converted_cables:
             coords = cable['coords']
-            if len(coords) >= 2 and SHAPELY_AVAILABLE:
+            if len(coords) >= 2:
                 line = LineString(coords)
                 try:
                     poly = line.buffer(4.0, cap_style=2, join_style=2)
                     if not poly.is_empty:
-                        road_polygons.append({
-                            'name': 'JALAN UTAMA (FALLBACK)',
-                            'geometry': poly,
-                            'is_polygon': True
-                        })
-                        road_source = 'FALLBACK_CORRIDOR'
+                        polygons.append(poly)
                 except Exception:
-                    pass
-        if road_polygons:
-            road_polygons = dissolve_road_polygons(road_polygons)
+                    continue
+        if polygons:
+            try:
+                dissolved = unary_union(polygons)
+                if not dissolved.is_empty:
+                    if dissolved.geom_type == 'Polygon':
+                        road_polygons = [{'geometry': dissolved, 'name': ''}]
+                    elif dissolved.geom_type == 'MultiPolygon':
+                        road_polygons = [{'geometry': g, 'name': ''} for g in dissolved.geoms]
+                    road_source = 'FALLBACK_CORRIDOR'
+            except Exception:
+                pass
 
     return {
         'cables': converted_cables,
@@ -390,7 +396,7 @@ def build_dxf_document(data, proj_info):
     msp = doc.modelspace()
     all_x, all_y = [], []
 
-    # === JALAN (hasil dissolve) ===
+    # ===== JALAN (exterior dari poligon hasil dissolve) =====
     for road in data.get('road_polygons', []):
         geom = road.get('geometry')
         if geom is None:
@@ -410,7 +416,7 @@ def build_dxf_document(data, proj_info):
         except Exception:
             continue
 
-    # === KABEL ===
+    # ===== KABEL =====
     for cable in data['cables']:
         pts = cable['coords']
         if len(pts) < 2:
@@ -419,11 +425,12 @@ def build_dxf_document(data, proj_info):
             all_x.append(pt[0]); all_y.append(pt[1])
         msp.add_lwpolyline(pts, dxfattribs={'layer': '03_KABEL_FO', 'color': 1, 'lineweight': 50})
 
-    # === TIANG ===
+    # ===== TIANG & AKSESORIS =====
     for p in data['poles']:
         pos = p['coords']
         name = p['name']
         all_x.append(pos[0]); all_y.append(pos[1])
+
         msp.add_circle(pos, radius=0.8, dxfattribs={'layer': '04_POLE_TIANG', 'color': 3})
         display_name = smart_rename(name)
 
@@ -449,7 +456,7 @@ def build_dxf_document(data, proj_info):
             'color': 3
         }).set_placement((pos[0] + 1.8, pos[1] + text_y_offset))
 
-    # === LAYOUT A3 ===
+    # ===== LAYOUT A3 =====
     if "Paper_A3" in doc.layouts:
         layout = doc.layouts.get("Paper_A3")
     else:
@@ -475,7 +482,7 @@ def build_dxf_document(data, proj_info):
         view_height=h * 1.18
     )
 
-    # === TITLE BLOCK ===
+    # ===== TITLE BLOCK =====
     tb_x1, tb_y1 = 300, 20
     tb_x2, tb_y2 = 410, 270
     layout.add_lwpolyline([
@@ -513,7 +520,7 @@ def build_dxf_document(data, proj_info):
     add_title_text("PT. RIZKI PRIMA SAKTI", tb_x1+5, tb_y1+5, 2.5)
     add_title_text("CLIENT: iFORTE", tb_x1+5, tb_y1+12, 2.5)
 
-    # === LEGENDA ===
+    # ===== LEGENDA =====
     leg_x1, leg_y1 = 20, 20
     leg_x2, leg_y2 = 120, 80
     layout.add_lwpolyline([
@@ -563,8 +570,8 @@ geojson_path = st.sidebar.text_input(
 )
 st.sidebar.caption("Kosongkan jika ingin menggunakan Overpass API online")
 
-st.title("⚡ ASPLAN PRO v14.1 - Dissolve Otomatis + Offline-First")
-st.caption("Prioritas: GeoJSON Lokal → Overpass API → Fallback Corridor (dengan dissolve)")
+st.title("⚡ ASPLAN PRO v14.2 - Buffer → Dissolve → Boundary")
+st.caption("Prioritas: GeoJSON Lokal → Overpass API → Fallback (dengan buffer & dissolve)")
 
 uploaded_file = st.file_uploader("📂 Upload File KMZ", type=['kmz'])
 
@@ -585,7 +592,7 @@ if uploaded_file:
             ax.set_facecolor('#0e1117')
             fig.patch.set_facecolor('#0e1117')
 
-            # Jalan hasil dissolve
+            # Jalan (exterior dari poligon hasil dissolve)
             for r in parsed['road_polygons']:
                 geom = r.get('geometry')
                 if geom is None:
