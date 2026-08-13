@@ -5,26 +5,25 @@ import xml.etree.ElementTree as ET
 import zipfile
 import math
 import io
+import urllib.request
+import json
 import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="ASPLAN PRO v12.1", layout="wide")
 
 # ==========================================
-# 1. HELPER & UTILITY FUNCTIONS
+# 1. HELPER & GIS UTILITY FUNCTIONS
 # ==========================================
 
 def latlon_to_meters(lon, lat, ref_lon, ref_lat):
-    """Konversi koordinat Lat/Lon (derajat) ke Meter lokal (Mercator/Flat Projection)"""
+    """Konversi koordinat Lat/Lon (derajat) ke Meter lokal (Mercator Projection)"""
     r = 6378137.0 # Jari-jari bumi
     x = r * math.radians(lon - ref_lon) * math.cos(math.radians(ref_lat))
     y = r * math.radians(lat - ref_lat)
     return x, y
 
 def generate_corridor_polylines(coords, width=6.0):
-    """
-    Menghitung vektor offset kiri & kanan dari alur kabel 
-    untuk menggambarkan badan jalan secara otomatis.
-    """
+    """Fallback: Menhitung offset kiri-kanan jika GIS api offline"""
     half_w = width / 2.0
     left_pts, right_pts = [], []
 
@@ -49,6 +48,46 @@ def generate_corridor_polylines(coords, width=6.0):
             right_pts.append((x2 - nx * half_w, y2 - ny * half_w))
 
     return left_pts, right_pts
+
+def fetch_real_road_network(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat):
+    """
+    Menarik data vektor peta jalan resmi & nama jalan asli dari OpenStreetMap (Overpass API)
+    berdasarkan Bounding Box area KMZ secara otomatis.
+    """
+    # Beri margin 0.002 derajat (~200m) di sekeliling bounding box KMZ
+    pad = 0.002
+    query = f"""
+    [out:json][timeout:10];
+    way["highway"]({min_lat-pad},{min_lon-pad},{max_lat+pad},{max_lon+pad});
+    out geometry;
+    """
+    overpass_url = "https://overpass-api.de/api/interpreter"
+    
+    try:
+        req = urllib.request.Request(
+            overpass_url, 
+            data=query.encode('utf-8'),
+            headers={'User-Agent': 'ASPLAN-PRO-Converter/12.1'}
+        )
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode('utf-8'))
+        
+        roads = []
+        for element in data.get('elements', []):
+            street_name = element.get('tags', {}).get('name', '')
+            geom = element.get('geometry', [])
+            
+            m_points = [latlon_to_meters(pt['lon'], pt['lat'], ref_lon, ref_lat) for pt in geom]
+            
+            if len(m_points) >= 2:
+                roads.append({
+                    'name': street_name,
+                    'coords': m_points
+                })
+        return roads
+    except Exception:
+        # Fallback jika terjadi kendala koneksi API
+        return []
 
 def parse_kmz(kmz_bytes):
     """Parsing KMZ/KML dan ekstraksi data kabel & tiang + deteksi overlap"""
@@ -97,19 +136,23 @@ def parse_kmz(kmz_bytes):
                 })
 
     if not all_raw_coords:
-        return {'cables': [], 'poles': [], 'inspector': []}
+        return {'cables': [], 'poles': [], 'inspector': [], 'bbox': (0,0,0,0), 'ref': (0,0)}
 
-    # Hitung Center Reference untuk proyeksi meter lokal
-    ref_lon = sum(pt[0] for pt in all_raw_coords) / len(all_raw_coords)
-    ref_lat = sum(pt[1] for pt in all_raw_coords) / len(all_raw_coords)
+    lons = [p[0] for p in all_raw_coords]
+    lats = [p[1] for p in all_raw_coords]
+    min_lon, max_lon = min(lons), max(lons)
+    min_lat, max_lat = min(lats), max(lats)
 
-    # Konversi koordinat Kabel ke Meter
+    ref_lon = sum(lons) / len(lons)
+    ref_lat = sum(lats) / len(lats)
+
+    # Konversi kabel ke meter
     converted_cables = []
     for c in cables:
         m_pts = [latlon_to_meters(lon, lat, ref_lon, ref_lat) for lon, lat in c['coords']]
         converted_cables.append({'name': c['name'], 'coords': m_pts})
 
-    # Konversi koordinat Tiang & Deteksi Overlap
+    # Konversi tiang & deteksi overlap
     converted_poles = []
     inspector_logs = []
     coord_tracker = {}
@@ -118,7 +161,6 @@ def parse_kmz(kmz_bytes):
         mx, my = latlon_to_meters(p['raw_coords'][0], p['raw_coords'][1], ref_lon, ref_lat)
         coord_key = (round(mx, 2), round(my, 2))
 
-        # Peringatan Precision & Quality Inspector jika bertumpuk
         if coord_key in coord_tracker:
             inspector_logs.append({
                 'level': 'WARNING',
@@ -138,7 +180,9 @@ def parse_kmz(kmz_bytes):
     return {
         'cables': converted_cables,
         'poles': converted_poles,
-        'inspector': inspector_logs
+        'inspector': inspector_logs,
+        'bbox': (min_lon, min_lat, max_lon, max_lat),
+        'ref': (ref_lon, ref_lat)
     }
 
 # ==========================================
@@ -151,16 +195,45 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
 
     # Setup Layering & Lineweight
     layers = doc.layers
-    layers.add("01_BADAN_JALAN", color=8, lineweight=13)
-    layers.add("03_KABEL_FO", color=1, lineweight=50)
-    layers.add("04_POLE_TIANG", color=3, lineweight=30)
-    layers.add("05_SMARTBOX_SLACK", color=2, lineweight=25)
-    layers.add("KOP_TITLE_BLOCK", color=7, lineweight=25)
+    layers.add("01_BADAN_JALAN", color=8, lineweight=13)        # Abu-abu
+    layers.add("01_NAMA_JALAN", color=2, lineweight=18)         # Kuning (Nama Jalan)
+    layers.add("03_KABEL_FO", color=1, lineweight=50)           # Merah Utama (0.50mm)
+    layers.add("04_POLE_TIANG", color=3, lineweight=30)         # Hijau Tiang
+    layers.add("05_SMARTBOX_SLACK", color=2, lineweight=25)     # Smartbox & Slack
+    layers.add("KOP_TITLE_BLOCK", color=7, lineweight=25)       # Kop Gambar
 
     msp = doc.modelspace()
     all_x, all_y = [], []
 
-    # A. Render Kabel & Koridor Jalan
+    # A. Fetch & Render Peta Jalan Asli dari GIS (OSM)
+    min_lon, min_lat, max_lon, max_lat = parsed_data['bbox']
+    ref_lon, ref_lat = parsed_data['ref']
+    
+    real_roads = fetch_real_road_network(min_lon, min_lat, max_lon, max_lat, ref_lon, ref_lat)
+
+    if real_roads:
+        for road in real_roads:
+            pts = road['coords']
+            msp.add_lwpolyline(pts, dxfattribs={'layer': '01_BADAN_JALAN'})
+            
+            # Tulis Nama Jalan di Tengah Segmen jika ada
+            if road['name'] and len(pts) >= 2:
+                mid_idx = len(pts) // 2
+                mid_pt = pts[mid_idx]
+                msp.add_text(road['name'].upper(), dxfattribs={
+                    'layer': '01_NAMA_JALAN',
+                    'height': 2.5
+                }).set_placement((mid_pt[0], mid_pt[1] + 1.5))
+    else:
+        # Fallback corridor generator jika offline
+        for cable in parsed_data['cables']:
+            left_b, right_b = generate_corridor_polylines(cable['coords'], width=road_width)
+            if left_b:
+                msp.add_lwpolyline(left_b, dxfattribs={'layer': '01_BADAN_JALAN'})
+            if right_b:
+                msp.add_lwpolyline(right_b, dxfattribs={'layer': '01_BADAN_JALAN'})
+
+    # B. Render Kabel Utama
     for cable in parsed_data['cables']:
         pts = cable['coords']
         if len(pts) < 2:
@@ -171,25 +244,18 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
 
         msp.add_lwpolyline(pts, dxfattribs={'layer': '03_KABEL_FO'})
 
-        # Peta Jalan Otomatis
-        left_b, right_b = generate_corridor_polylines(pts, width=road_width)
-        if left_b:
-            msp.add_lwpolyline(left_b, dxfattribs={'layer': '01_BADAN_JALAN'})
-        if right_b:
-            msp.add_lwpolyline(right_b, dxfattribs={'layer': '01_BADAN_JALAN'})
-
-    # B. Render Tiang & Terapkan Aturan Bisnis Kak Donny
+    # C. Render Tiang & Aturan Bisnis Kak Donny
     for p in parsed_data['poles']:
         pos = p['coords']
         name = p['name']
         all_x.append(pos[0])
         all_y.append(pos[1])
 
-        # Gambar Tiang (Bila overlap, tetap digambar)
+        # Gambar Tiang (Termasuk yang overlap tetap digambar)
         msp.add_circle(pos, radius=0.8, dxfattribs={'layer': '04_POLE_TIANG'})
 
-        # Aturan Aksesoris -> Smartbox & "New Slack Support"
         text_y_offset = 0.8
+        # Aturan Aksesoris -> Smartbox & "New Slack Support"
         if p['has_accessories']:
             msp.add_rectangle4p([
                 (pos[0]-1.2, pos[1]-1.2), (pos[0]+1.2, pos[1]-1.2),
@@ -210,7 +276,7 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
         else:
             display_name = name
 
-        # Jika overlap, beri sedikit offset teks vertikal agar tidak menumpuk total
+        # Jika overlap, geser offset vertikal teks agar tidak menumpuk
         if p.get('is_overlap'):
             text_y_offset += 1.2
 
@@ -218,13 +284,13 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
             'layer': '04_POLE_TIANG', 'height': 0.9
         }).set_placement((pos[0] + 1.8, pos[1] + text_y_offset))
 
-    # C. Dynamic Viewport A3 Layout Space
+    # D. Dynamic Viewport A3 Layout Space
     if "Paper_A3_Presentation" in doc.layouts:
         layout = doc.layouts.get("Paper_A3_Presentation")
     else:
         layout = doc.layouts.new("Paper_A3_Presentation")
 
-    # Ukuran Kertas A3 (420mm x 297mm) Tanpa Method page_setup yang Error
+    # Kunci ukuran kertas A3 (420mm x 297mm)
     layout.dxf.paper_width = 420.0
     layout.dxf.paper_height = 297.0
 
@@ -240,7 +306,7 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
         view_height=h * 1.18
     )
 
-    # D. Isi Informasi Kop Gambar dari Sidebar
+    # E. Isi Informasi Kop Gambar dari Sidebar
     layout.add_text(proj_info.get('span_name', ''), dxfattribs={'layer': 'KOP_TITLE_BLOCK', 'height': 3.5}).set_placement((315, 45))
     layout.add_text(proj_info.get('project_code', ''), dxfattribs={'layer': 'KOP_TITLE_BLOCK', 'height': 3.5}).set_placement((315, 35))
     layout.add_text(proj_info.get('drawn_by', 'RPS'), dxfattribs={'layer': 'KOP_TITLE_BLOCK', 'height': 3.0}).set_placement((345, 18))
