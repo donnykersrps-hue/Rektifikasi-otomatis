@@ -18,14 +18,14 @@ import numpy as np
 # CONFIG & PAGE SETUP
 # ==============================================================================
 st.set_page_config(
-    page_title="ASPLAN PRO v11.6 - KMZ to DXF Converter & Layout Generator",
+    page_title="ASPLAN PRO v11.7 - KMZ to DXF Converter & Layout Generator",
     page_icon="🗺️",
     layout="wide"
 )
 
 ox.settings.use_cache = True
 ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v11.6"
+ox.settings.user_agent = "AsplanPro_v11.7"
 
 ROAD_WIDTHS = {
     'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
@@ -46,7 +46,7 @@ with st.sidebar:
     date = st.date_input("Tanggal", datetime.now())
     include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
     st.markdown("---")
-    st.caption("ASPLAN PRO v11.6 - © 2026")
+    st.caption("ASPLAN PRO v11.7 - © 2026")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -241,7 +241,7 @@ def get_model_bounding_box(msp):
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
 # ==============================================================================
-# FUNGSI CREATE_LAYOUT (PERFEKSIONIS & BEBAS BUG)
+# FUNGSI CREATE_LAYOUT (FIX PARAMETER units='mm')
 # ==============================================================================
 def create_layout(doc, msp, model_bbox, meta):
     """Buat Paperspace Layout A3 ISO Landscape dengan page_setup resmi ezdxf"""
@@ -253,8 +253,8 @@ def create_layout(doc, msp, model_bbox, meta):
     paper_width = 420.0   # mm
     paper_height = 297.0  # mm
 
-    # SOLUSI PRESISI: Menggunakan page_setup dengan tuple angka dan unit 'mm'
-    layout.page_setup(size=(paper_width, paper_height), unit='mm', margins=(0, 0, 0, 0))
+    # SOLUSI: Menggunakan units='mm' (dengan huruf 's')
+    layout.page_setup(size=(paper_width, paper_height), units='mm', margins=(0, 0, 0, 0))
 
     # ===== FRAME =====
     margin = 10
@@ -448,7 +448,7 @@ def render_compact_viewport(data, road_polygons, to_m_func):
 # ==============================================================================
 # MAIN APP
 # ==============================================================================
-st.title("⚡ ASPLAN PRO v11.6")
+st.title("⚡ ASPLAN PRO v11.7")
 st.subheader("Interactive CAD Converter with Layout & Precision Inspector")
 
 uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
