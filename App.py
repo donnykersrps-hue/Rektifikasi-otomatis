@@ -87,7 +87,6 @@ def parse_kmz(kmz_bytes):
                 name = placemark.findtext('kml:name', 'Pole', ns)
                 all_raw_coords.append((lon, lat))
                 
-                # Cek apakah tiang memiliki aksesoris (berdasarkan deskripsi/style/nama)
                 desc = placemark.findtext('kml:description', '', ns).lower()
                 has_acc = 'acc' in desc or 'accessories' in desc or 'slack' in desc or 'box' in desc
                 
@@ -225,7 +224,9 @@ def build_dxf_document(parsed_data, proj_info, road_width=6.0):
     else:
         layout = doc.layouts.new("Paper_A3_Presentation")
 
-    layout.page_setup(size=(420, 297), unit="mm")
+    # Ukuran Kertas A3 (420mm x 297mm) Tanpa Method page_setup yang Error
+    layout.dxf.paper_width = 420.0
+    layout.dxf.paper_height = 297.0
 
     min_x, max_x = (min(all_x), max(all_x)) if all_x else (0, 100)
     min_y, max_y = (min(all_y), max(all_y)) if all_y else (0, 100)
