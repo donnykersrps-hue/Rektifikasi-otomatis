@@ -18,14 +18,14 @@ import numpy as np
 # CONFIG & PAGE SETUP
 # ==============================================================================
 st.set_page_config(
-    page_title="ASPLAN PRO v11.2 - KMZ to DXF Converter & Layout Generator",
+    page_title="ASPLAN PRO v11.3 - KMZ to DXF Converter & Layout Generator",
     page_icon="🗺️",
     layout="wide"
 )
 
 ox.settings.use_cache = True
 ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v11.2"
+ox.settings.user_agent = "AsplanPro_v11.3"
 
 ROAD_WIDTHS = {
     'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
@@ -46,7 +46,7 @@ with st.sidebar:
     date = st.date_input("Tanggal", datetime.now())
     include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
     st.markdown("---")
-    st.caption("ASPLAN PRO v11.2 - © 2026")
+    st.caption("ASPLAN PRO v11.3 - © 2026")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -241,27 +241,32 @@ def get_model_bounding_box(msp):
     pad_y = (max_y - min_y) * 0.1 if max_y != min_y else 1
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
+# ==============================================================================
+# FUNGSI CREATE_LAYOUT YANG DIPERBAIKI (menggunakan page_setup)
+# ==============================================================================
 def create_layout(doc, msp, model_bbox, meta):
-    """Buat Paperspace Layout A3"""
+    """Buat Paperspace Layout A3 dengan page_setup bawaan ezdxf"""
     # Hapus layout jika sudah ada (untuk menghindari duplikasi)
     if 'Gambar Utama' in doc.layouts:
         doc.layouts.delete('Gambar Utama')
-    layout = doc.layouts.new('Gambar Utama')  # ← PERBAIKAN: tanpa argumen paperspace
+    layout = doc.layouts.new('Gambar Utama')
 
-    paper_width = 420  # mm
+    # ===== PERBAIKAN: Gunakan page_setup bawaan ezdxf untuk ISO A3 Landscape =====
+    layout.page_setup(size=('A3', 'Landscape'), margins=(0, 0, 0, 0))
+    # Ukuran kertas dalam mm (sesuai A3 Landscape)
+    paper_width = 420
     paper_height = 297
-    layout.set_paper_size((paper_width, paper_height), 'mm')
-    layout.set_plot_limits((0,0), (paper_width, paper_height))
 
-    # FRAME
+    # ===== FRAME =====
     margin = 10
     frame = [(margin, margin), (paper_width-margin, margin),
              (paper_width-margin, paper_height-margin), (margin, paper_height-margin)]
     layout.add_lwpolyline(frame, close=True, dxfattribs={'layer': 'FRAME', 'color': 7, 'lineweight': 35})
 
-    # VIEWPORT
+    # ===== VIEWPORT UTAMA =====
     vp_x1, vp_y1 = 20, 20
-    vp_x2, vp_y2 = 280, 260
+    vp_x2, vp_y2 = 280, 260   # mm
+
     min_x, min_y, max_x, max_y = model_bbox
     model_w = max_x - min_x
     model_h = max_y - min_y
@@ -288,7 +293,7 @@ def create_layout(doc, msp, model_bbox, meta):
     viewport.dxf.color = 7
     viewport.dxf.on = False
 
-    # TITLE BLOCK
+    # ===== TITLE BLOCK =====
     tb_x1 = 295
     tb_y1 = 20
     tb_x2 = paper_width - margin
@@ -319,7 +324,7 @@ def create_layout(doc, msp, model_bbox, meta):
     y_pos -= 5
     add_text(layout, "Revision: 0", tb_x1+5, y_pos, height=2.5)
 
-    # LEGENDA
+    # ===== LEGENDA =====
     leg_x1 = tb_x1
     leg_y1 = tb_y1 + 10
     leg_x2 = tb_x2 - 5
@@ -338,7 +343,7 @@ def create_layout(doc, msp, model_bbox, meta):
         add_text(layout, f"• {label}", leg_x1+5, yy, height=2.2, color=color)
         yy -= 5
 
-    # KEY MAP
+    # ===== KEY MAP =====
     km_x1, km_y1 = 20, 20
     km_x2, km_y2 = 80, 60
     km_viewport = layout.add_viewport(
@@ -354,7 +359,7 @@ def create_layout(doc, msp, model_bbox, meta):
                           close=True, dxfattribs={'layer': 'KEYMAP', 'color': 7})
     add_text(layout, "KEY MAP", km_x1+2, km_y2-3, height=2, color=7)
 
-    # LOGO
+    # ===== LOGO PLACEHOLDER =====
     add_text(layout, "PT. Rizki Prima Sakti", tb_x1+5, tb_y1+5, height=2.5, color=4)
     add_text(layout, "Client: iFORTE", tb_x1+5, tb_y1+10, height=2.5, color=4)
 
@@ -437,7 +442,7 @@ def render_compact_viewport(data, road_polygons, to_m_func):
 # ==============================================================================
 # MAIN APP
 # ==============================================================================
-st.title("⚡ ASPLAN PRO v11.2")
+st.title("⚡ ASPLAN PRO v11.3")
 st.subheader("Interactive CAD Converter with Layout & Precision Inspector")
 
 uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
