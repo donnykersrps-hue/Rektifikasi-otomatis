@@ -18,14 +18,14 @@ import numpy as np
 # CONFIG & PAGE SETUP
 # ==============================================================================
 st.set_page_config(
-    page_title="ASPLAN PRO v11.7 - KMZ to DXF Converter & Layout Generator",
+    page_title="ASPLAN PRO v12.0 - KMZ to DXF Converter & Layout Generator",
     page_icon="🗺️",
     layout="wide"
 )
 
 ox.settings.use_cache = True
 ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v11.7"
+ox.settings.user_agent = "AsplanPro_v12.0"
 
 ROAD_WIDTHS = {
     'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
@@ -34,19 +34,37 @@ ROAD_WIDTHS = {
 }
 
 # ==============================================================================
-# SIDEBAR - METADATA PROYEK
+# SIDEBAR - METADATA KOP GAMBAR (INPUT DINAMIS STANDAR IFORTE)
 # ==============================================================================
 with st.sidebar:
     st.image("https://via.placeholder.com/150x50?text=LOGO", use_container_width=True)
-    st.header("📋 Informasi Proyek")
-    project_name = st.text_input("Nama Proyek", "AS-BUILT FIBER OPTIC")
-    span_name = st.text_input("Nama Ruas / Span", "Ruas A - B")
-    author = st.text_input("Dibuat Oleh", "Surveyor")
-    verifier = st.text_input("Diverifikasi Oleh", "Engineer")
-    date = st.date_input("Tanggal", datetime.now())
+    st.header("📋 Informasi Proyek (Kop Gambar)")
+    
+    # 1. SPAN & PROYEK
+    span_name = st.text_input("SPAN NAME", "14PBG007_REMBANGPBLG - 14PBG031_PENGADEGAN_TB")
+    project_name = st.text_input("NAME OF PROJECT", "AS BUILD")
+    project_code = st.text_input("PROJECT CODE / REVISION CODE", "RM-26-000327")
+    
+    st.markdown("---")
+    st.subheader("✍️ Personel & Otorisasi")
+    
+    # 2. TABEL PERSETUJUAN
+    drawn_by = st.text_input("DRAWN BY (Initial)", "RPS")
+    checked_by = st.text_input("CHECKED BY (Initial)", "IFORTE")
+    approved_by = st.text_input("APPROVED BY (Initial)", "IFORTE")
+    
+    st.markdown("---")
+    st.subheader("⚙️ Parameter Gambar")
+    
+    # 3. REVISION, SCALE, PAGE & DATE
+    revision_val = st.text_input("REVISION", "0")
+    scale_val = st.text_input("SCALE", "AS INFO")
+    page_val = st.text_input("PAGE", "1 OF 1")
+    date_val = st.date_input("DATE", datetime.now())
+    
     include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
     st.markdown("---")
-    st.caption("ASPLAN PRO v11.7 - © 2026")
+    st.caption("ASPLAN PRO v12.0 - © 2026")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -241,10 +259,10 @@ def get_model_bounding_box(msp):
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
 # ==============================================================================
-# FUNGSI CREATE_LAYOUT (FIX PARAMETER units='mm')
+# FUNGSI CREATE_LAYOUT (TITLE BLOCK STANDAR IFORTE - ISO A3 LANDSCAPE)
 # ==============================================================================
 def create_layout(doc, msp, model_bbox, meta):
-    """Buat Paperspace Layout A3 ISO Landscape dengan page_setup resmi ezdxf"""
+    """Buat Layout A3 dengan Title Block Standar iFORTE Presisi"""
     if 'Gambar Utama' in doc.layouts:
         doc.layouts.delete('Gambar Utama')
 
@@ -253,10 +271,9 @@ def create_layout(doc, msp, model_bbox, meta):
     paper_width = 420.0   # mm
     paper_height = 297.0  # mm
 
-    # SOLUSI: Menggunakan units='mm' (dengan huruf 's')
     layout.page_setup(size=(paper_width, paper_height), units='mm', margins=(0, 0, 0, 0))
 
-    # ===== FRAME =====
+    # ===== BORDER KERTAS =====
     margin = 10
     frame = [(margin, margin), (paper_width-margin, margin),
              (paper_width-margin, paper_height-margin), (margin, paper_height-margin)]
@@ -293,56 +310,100 @@ def create_layout(doc, msp, model_bbox, meta):
     viewport.dxf.layer = 'VIEWPORT'
     viewport.dxf.color = 7
 
+    # ===== TITLE BLOCK STANDAR IFORTE =====
+    tb_x1 = 285
+    tb_y1 = 10
+    tb_x2 = paper_width - margin  # 410
+    tb_y2 = paper_height - margin # 287
 
-    # ===== TITLE BLOCK =====
-    tb_x1 = 295
-    tb_y1 = 20
-    tb_x2 = paper_width - margin
-    tb_y2 = paper_height - margin
+    # Outer Frame Title Block
     layout.add_lwpolyline([(tb_x1, tb_y1), (tb_x2, tb_y1), (tb_x2, tb_y2), (tb_x1, tb_y2)],
                           close=True, dxfattribs={'layer': 'TITLE', 'color': 7, 'lineweight': 25})
 
-    def add_text(layout, text, x, y, height=2.5, layer='TITLE', color=7, style='ARIAL_STD'):
-        layout.add_text(text, dxfattribs={'layer': layer, 'height': height, 'color': color, 'style': style}
-                        ).set_placement((x, y))
+    def add_txt(text, x, y, height=2.5, color=7, align_center=False):
+        t = layout.add_text(text, dxfattribs={'layer': 'TITLE', 'height': height, 'color': color, 'style': 'ARIAL_STD'})
+        if align_center:
+            t.set_placement((x, y), attachment_point=4) # Middle Center
+        else:
+            t.set_placement((x, y))
 
-    y_pos = tb_y2 - 5
-    add_text(layout, "TECHNICAL DRAWING", tb_x1+5, y_pos, height=5, color=1)
-    y_pos -= 10
-    add_text(layout, f"Project : {meta['project']}", tb_x1+5, y_pos, height=3)
-    y_pos -= 6
-    add_text(layout, f"Span    : {meta['span']}", tb_x1+5, y_pos, height=3)
-    y_pos -= 6
-    add_text(layout, f"Author  : {meta['author']}", tb_x1+5, y_pos, height=3)
-    y_pos -= 6
-    add_text(layout, f"Date    : {meta['date']}", tb_x1+5, y_pos, height=3)
-    y_pos -= 6
-    add_text(layout, f"Scale   : 1:{int(scale*1000) if scale*1000>1 else 1}", tb_x1+5, y_pos, height=3)
-    y_pos -= 8
-    layout.add_line((tb_x1, y_pos), (tb_x2, y_pos), dxfattribs={'layer': 'TITLE', 'color': 7})
-    y_pos -= 4
-    add_text(layout, "Verifier : " + meta['verifier'], tb_x1+5, y_pos, height=2.5)
-    y_pos -= 5
-    add_text(layout, "Revision: 0", tb_x1+5, y_pos, height=2.5)
+    # --- SEKSI SPAN NAME ---
+    layout.add_line((tb_x1, tb_y2-20), (tb_x2, tb_y2-20), dxfattribs={'layer': 'TITLE', 'color': 7})
+    add_txt("SPAN NAME :", tb_x1+3, tb_y2-5, height=2.0)
+    add_txt(meta['span_name'], (tb_x1+tb_x2)/2, tb_y2-13, height=2.5, align_center=True)
+
+    # --- SEKSI NAME OF PROJECT ---
+    layout.add_line((tb_x1, tb_y2-45), (tb_x2, tb_y2-45), dxfattribs={'layer': 'TITLE', 'color': 7})
+    add_txt("NAME OF PROJECT :", tb_x1+3, tb_y2-25, height=2.0)
+    add_txt(meta['project_name'], (tb_x1+tb_x2)/2, tb_y2-33, height=3.0, align_center=True)
+    add_txt(meta['project_code'], (tb_x1+tb_x2)/2, tb_y2-40, height=2.5, align_center=True)
+
+    # --- SEKSI REVISION & APPROVAL TABLE ---
+    # Tabel Header
+    layout.add_line((tb_x1, tb_y2-60), (tb_x2, tb_y2-60), dxfattribs={'layer': 'TITLE', 'color': 7})
+    add_txt("REVISION", tb_x1+3, tb_y2-52, height=2.0)
+    
+    # Kolom Vertikal Tabel Approval
+    x_col1 = tb_x1 + 30
+    x_col2 = tb_x1 + 75
+    x_col3 = tb_x1 + 100
+    
+    layout.add_line((x_col1, tb_y2-45), (x_col1, tb_y2-110), dxfattribs={'layer': 'TITLE', 'color': 7})
+    layout.add_line((x_col2, tb_y2-45), (x_col2, tb_y2-110), dxfattribs={'layer': 'TITLE', 'color': 7})
+    layout.add_line((x_col3, tb_y2-45), (x_col3, tb_y2-110), dxfattribs={'layer': 'TITLE', 'color': 7})
+
+    add_txt("INITIAL NAME", x_col1+5, tb_y2-52, height=1.8)
+    add_txt("DATE", x_col2+5, tb_y2-52, height=1.8)
+    add_txt("SIGN", x_col3+5, tb_y2-52, height=1.8)
+
+    # Baris DRAWN BY
+    layout.add_line((tb_x1, tb_y2-75), (tb_x2, tb_y2-75), dxfattribs={'layer': 'TITLE', 'color': 7})
+    add_txt("DRAWN BY", x_col1-25, tb_y2-70, height=1.8)
+    add_txt(meta['drawn_by'], x_col1+5, tb_y2-70, height=2.0)
+    add_txt(meta['date_str'], x_col2+2, tb_y2-70, height=1.8)
+
+    # Baris CHECKED BY
+    layout.add_line((tb_x1, tb_y2-90), (tb_x2, tb_y2-90), dxfattribs={'layer': 'TITLE', 'color': 7})
+    add_txt("CHECKED BY", x_col1-27, tb_y2-85, height=1.8)
+    add_txt(meta['checked_by'], x_col1+5, tb_y2-85, height=2.0)
+    add_txt(meta['date_str'], x_col2+2, tb_y2-85, height=1.8)
+
+    # Baris APPROVED BY
+    layout.add_line((tb_x1, tb_y2-105), (tb_x2, tb_y2-105), dxfattribs={'layer': 'TITLE', 'color': 7})
+    add_txt("APPROVED BY", x_col1-28, tb_y2-100, height=1.8)
+    add_txt(meta['approved_by'], x_col1+5, tb_y2-100, height=2.0)
+    add_txt(meta['date_str'], x_col2+2, tb_y2-100, height=1.8)
+
+    # --- SEKSI SCALE & PAGE ---
+    x_scale_col = tb_x1 + 80
+    layout.add_line((x_scale_col, tb_y2-105), (x_scale_col, tb_1_bottom if 'tb_1_bottom' in locals() else tb_y1), dxfattribs={'layer': 'TITLE', 'color': 7})
+    layout.add_line((tb_x1, tb_y2-120), (tb_x2, tb_y2-120), dxfattribs={'layer': 'TITLE', 'color': 7})
+    
+    add_txt("SCALE", x_scale_col+2, tb_y2-110, height=1.8)
+    add_txt(meta['scale_val'], x_scale_col+2, tb_y2-117, height=2.0)
+
+    layout.add_line((tb_x1, tb_y2-135), (tb_x2, tb_y2-135), dxfattribs={'layer': 'TITLE', 'color': 7})
+    add_txt("PAGE", x_scale_col+2, tb_y2-125, height=1.8)
+    add_txt(meta['page_val'], x_scale_col+2, tb_y2-132, height=2.0)
 
     # ===== LEGENDA =====
     leg_x1 = tb_x1
     leg_y1 = tb_y1 + 10
     leg_x2 = tb_x2 - 5
-    leg_y2 = leg_y1 + 60
+    leg_y2 = leg_y1 + 50
     layout.add_lwpolyline([(leg_x1, leg_y1), (leg_x2, leg_y1), (leg_x2, leg_y2), (leg_x1, leg_y2)],
                           close=True, dxfattribs={'layer': 'LEGEND', 'color': 7})
-    add_text(layout, "LEGENDA", leg_x1+5, leg_y2-4, height=3, color=1)
+    add_txt("LEGENDA", leg_x1+5, leg_y2-4, height=2.5, color=1)
 
     items = [
-        ("Kabel Serat Optik", "03_KABEL", 5, "line"),
-        ("Tiang Telekom", "04_POLE", 7, "circle"),
-        ("Closure / Slack", "05_SMARTBOX", 1, "box"),
-        ("Badan Jalan", "01_BADAN_JALAN", 8, "poly")
+        ("Kabel Serat Optik", "03_KABEL", 5),
+        ("Tiang Telekom", "04_POLE", 7),
+        ("Closure / Slack", "05_SMARTBOX", 1),
+        ("Badan Jalan", "01_BADAN_JALAN", 8)
     ]
     yy = leg_y2 - 10
-    for label, layer, color, typ in items:
-        add_text(layout, f"• {label}", leg_x1+5, yy, height=2.2, color=color)
+    for label, layer, color in items:
+        add_txt(f"• {label}", leg_x1+5, yy, height=2.0, color=color)
         yy -= 5
 
     # ===== KEY MAP =====
@@ -356,14 +417,13 @@ def create_layout(doc, msp, model_bbox, meta):
     )
     km_viewport.dxf.layer = 'KEYMAP'
     km_viewport.dxf.color = 7
-
     layout.add_lwpolyline([(km_x1, km_y1), (km_x2, km_y1), (km_x2, km_y2), (km_x1, km_y2)],
                           close=True, dxfattribs={'layer': 'KEYMAP', 'color': 7})
-    add_text(layout, "KEY MAP", km_x1+2, km_y2-3, height=2, color=7)
+    add_txt("KEY MAP", km_x1+2, km_y2-3, height=2.0, color=7)
 
     # ===== LOGO PLACEHOLDER =====
-    add_text(layout, "PT. Rizki Prima Sakti", tb_x1+5, tb_y1+5, height=2.5, color=4)
-    add_text(layout, "Client: iFORTE", tb_x1+5, tb_y1+10, height=2.5, color=4)
+    add_txt("PT. Rizki Prima Sakti", tb_x1+5, tb_y1+5, height=2.2, color=4)
+    add_txt("Client: iFORTE", tb_x1+5, tb_y1+10, height=2.2, color=4)
 
 # ==============================================================================
 # INSPECTOR ENGINE
@@ -448,8 +508,8 @@ def render_compact_viewport(data, road_polygons, to_m_func):
 # ==============================================================================
 # MAIN APP
 # ==============================================================================
-st.title("⚡ ASPLAN PRO v11.7")
-st.subheader("Interactive CAD Converter with Layout & Precision Inspector")
+st.title("⚡ ASPLAN PRO v12.0")
+st.subheader("Interactive CAD Converter with Dynamic Title Block")
 
 uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
 
@@ -588,11 +648,16 @@ if uploaded_files:
             if include_layout:
                 model_bbox = get_model_bounding_box(msp)
                 meta = {
-                    'project': project_name,
-                    'span': span_name,
-                    'author': author,
-                    'verifier': verifier,
-                    'date': date.strftime("%d-%m-%Y")
+                    'span_name': span_name,
+                    'project_name': project_name,
+                    'project_code': project_code,
+                    'drawn_by': drawn_by,
+                    'checked_by': checked_by,
+                    'approved_by': approved_by,
+                    'revision': revision_val,
+                    'scale_val': scale_val,
+                    'page_val': page_val,
+                    'date_str': date_val.strftime("%d-%m-%Y")
                 }
                 create_layout(doc, msp, model_bbox, meta)
 
