@@ -1,6 +1,7 @@
 import streamlit as st
 import os
 import ezdxf
+from ezdxf.enums import TextEntityAlignment
 import osmnx as ox
 import math
 from zipfile import ZipFile
@@ -18,14 +19,14 @@ import numpy as np
 # CONFIG & PAGE SETUP
 # ==============================================================================
 st.set_page_config(
-    page_title="ASPLAN PRO v12.0 - KMZ to DXF Converter & Layout Generator",
+    page_title="ASPLAN PRO v12.1 - KMZ to DXF Converter & Layout Generator",
     page_icon="🗺️",
     layout="wide"
 )
 
 ox.settings.use_cache = True
 ox.settings.timeout = 1800
-ox.settings.user_agent = "AsplanPro_v12.0"
+ox.settings.user_agent = "AsplanPro_v12.1"
 
 ROAD_WIDTHS = {
     'motorway': 20.0, 'trunk': 16.0, 'primary': 14.0,
@@ -64,7 +65,7 @@ with st.sidebar:
     
     include_layout = st.checkbox("📄 Generate Layout Kertas (A3)", value=True)
     st.markdown("---")
-    st.caption("ASPLAN PRO v12.0 - © 2026")
+    st.caption("ASPLAN PRO v12.1 - © 2026")
 
 # ==============================================================================
 # HELPER FUNCTIONS
@@ -259,7 +260,7 @@ def get_model_bounding_box(msp):
     return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
 # ==============================================================================
-# FUNGSI CREATE_LAYOUT (TITLE BLOCK STANDAR IFORTE - ISO A3 LANDSCAPE)
+# FUNGSI CREATE_LAYOUT (TITLE BLOCK STANDAR IFORTE - PERFEKSIONIS FIX)
 # ==============================================================================
 def create_layout(doc, msp, model_bbox, meta):
     """Buat Layout A3 dengan Title Block Standar iFORTE Presisi"""
@@ -323,7 +324,8 @@ def create_layout(doc, msp, model_bbox, meta):
     def add_txt(text, x, y, height=2.5, color=7, align_center=False):
         t = layout.add_text(text, dxfattribs={'layer': 'TITLE', 'height': height, 'color': color, 'style': 'ARIAL_STD'})
         if align_center:
-            t.set_placement((x, y), attachment_point=4) # Middle Center
+            # PERBAIKAN: Gunakan align dengan TextEntityAlignment.MIDDLE_CENTER
+            t.set_placement((x, y), align=TextEntityAlignment.MIDDLE_CENTER)
         else:
             t.set_placement((x, y))
 
@@ -339,11 +341,9 @@ def create_layout(doc, msp, model_bbox, meta):
     add_txt(meta['project_code'], (tb_x1+tb_x2)/2, tb_y2-40, height=2.5, align_center=True)
 
     # --- SEKSI REVISION & APPROVAL TABLE ---
-    # Tabel Header
     layout.add_line((tb_x1, tb_y2-60), (tb_x2, tb_y2-60), dxfattribs={'layer': 'TITLE', 'color': 7})
     add_txt("REVISION", tb_x1+3, tb_y2-52, height=2.0)
     
-    # Kolom Vertikal Tabel Approval
     x_col1 = tb_x1 + 30
     x_col2 = tb_x1 + 75
     x_col3 = tb_x1 + 100
@@ -376,7 +376,7 @@ def create_layout(doc, msp, model_bbox, meta):
 
     # --- SEKSI SCALE & PAGE ---
     x_scale_col = tb_x1 + 80
-    layout.add_line((x_scale_col, tb_y2-105), (x_scale_col, tb_1_bottom if 'tb_1_bottom' in locals() else tb_y1), dxfattribs={'layer': 'TITLE', 'color': 7})
+    layout.add_line((x_scale_col, tb_y2-105), (x_scale_col, tb_y1), dxfattribs={'layer': 'TITLE', 'color': 7})
     layout.add_line((tb_x1, tb_y2-120), (tb_x2, tb_y2-120), dxfattribs={'layer': 'TITLE', 'color': 7})
     
     add_txt("SCALE", x_scale_col+2, tb_y2-110, height=1.8)
@@ -508,7 +508,7 @@ def render_compact_viewport(data, road_polygons, to_m_func):
 # ==============================================================================
 # MAIN APP
 # ==============================================================================
-st.title("⚡ ASPLAN PRO v12.0")
+st.title("⚡ ASPLAN PRO v12.1")
 st.subheader("Interactive CAD Converter with Dynamic Title Block")
 
 uploaded_files = st.file_uploader("Pilih File KMZ", type=['kmz'], accept_multiple_files=True)
