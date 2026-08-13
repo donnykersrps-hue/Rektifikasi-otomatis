@@ -1,0 +1,5 @@
+libgeos-dev
+gdal-bin
+libgdal-dev
+fontconfig
+ttf-mscorefonts-installer
